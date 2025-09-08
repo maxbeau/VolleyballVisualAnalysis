@@ -1,0 +1,12 @@
+# Environments
+.env
+
+# Data and Outputs
+/data/
+/outputs/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
