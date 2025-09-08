@@ -4,6 +4,7 @@ import bisect
 import cv2
 from typing import Dict, Any, List, Optional, Tuple
 from utils import load_env_file, ensure_dir, pick_video_path
+from smoothing import kalman_rts_smooth
 
 
 def to_tlbr_from_xywh(x: float, y: float, w: float, h: float) -> Tuple[int, int, int, int]:
@@ -56,46 +57,30 @@ def load_best_ball_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dic
 
 
 def build_interpolator(best: Dict[int, Dict[str, Any]], max_gap_frames: int) -> Tuple[List[int], Dict[int, Dict[str, Any]]]:
+    # Deprecated; kept for compatibility if other modules import it
     frames = sorted(best.keys())
     return frames, best
 
 
-def interp_pred(
+def pred_with_kalman_or_hold(
     frames: List[int],
     best: Dict[int, Dict[str, Any]],
+    smoothed: Dict[int, Dict[str, Any]],
     i: int,
-    max_gap_frames: int,
     hold_mode: str,
     hold_ttl: int,
 ) -> Optional[Dict[str, Any]]:
-    # exact
-    if i in best:
-        p = best[i].copy()
-        p["_interp"] = False
-        return p
+    # Prefer Kalman+RTS smoothed output if available
+    if i in smoothed:
+        return smoothed[i].copy()
+
+    # Otherwise, apply hold fallback based on configuration using raw observations
     if not frames:
         return None
     pos = bisect.bisect_left(frames, i)
     prev_idx = frames[pos - 1] if pos > 0 else None
     next_idx = frames[pos] if pos < len(frames) else None
 
-    # Try interpolate if both sides present and gap is small enough
-    if prev_idx is not None and next_idx is not None:
-        if next_idx - prev_idx <= max_gap_frames and prev_idx <= i <= next_idx:
-            t = (i - prev_idx) / float(max(1, (next_idx - prev_idx)))
-            p0 = best[prev_idx]
-            p1 = best[next_idx]
-            def getv(p, k):
-                return float(p.get(k, 0.0))
-            x = (1 - t) * getv(p0, "x") + t * getv(p1, "x")
-            y = (1 - t) * getv(p0, "y") + t * getv(p1, "y")
-            w = (1 - t) * getv(p0, "width") + t * getv(p1, "width")
-            h = (1 - t) * getv(p0, "height") + t * getv(p1, "height")
-            conf = (1 - t) * getv(p0, "confidence") + t * getv(p1, "confidence")
-            cls = p0.get("class", p1.get("class", "ball"))
-            return {"x": x, "y": y, "width": w, "height": h, "confidence": conf, "class": cls, "_interp": True}
-
-    # Otherwise, apply hold fallback based on configuration
     hold_mode = (hold_mode or "prev").lower()
     if hold_mode not in ("prev", "next", "both", "none"):
         hold_mode = "prev"
@@ -166,7 +151,11 @@ def main():
         out_path = alt_path
 
     best = load_best_ball_per_frame(jsonl_path, allowed)
-    frames_with_pred, best = build_interpolator(best, max_gap_frames)
+    frames_with_pred = sorted(best.keys())
+    # Observation gating configuration
+    gate_chisq = float(env.get("OBS_GATE_CHISQ_THRESH", 18.4))
+    gate_use_conf = parse_bool(env.get("OBS_GATE_USE_CONF", "true"), True)
+    smoothed = kalman_rts_smooth(best, max_gap_frames, gate_chisq, gate_use_conf)
 
     drawn = 0
     interp_count = 0
@@ -190,7 +179,7 @@ def main():
         if not ok:
             break
 
-        pred = interp_pred(frames_with_pred, best, i, max_gap_frames, hold_mode, hold_ttl)
+        pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl)
         if pred is not None:
             if float(pred.get("confidence", 0.0)) < min_conf:
                 pred = None

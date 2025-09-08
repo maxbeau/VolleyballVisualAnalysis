@@ -73,20 +73,21 @@ python3 detect_ball.py
 - 按 `INFER_FPS` 抽帧调用云推理，逐帧缓存 JPEG+JSON 到 `outputs/preds`。
 - 合并输出 `outputs/ball_detections.jsonl`（每行一个帧的预测）。
 
-2) 原始帧完整叠加 + 线性插值：`overlay_ball_full.py`
+2) 原始帧完整叠加 + 卡尔曼/RTS 平滑：`overlay_ball_full.py`
 ```bash
 python3 overlay_ball_full.py
 ```
 说明：
 - 逐帧读取原视频（保持原始帧率与时长）。
-- 在两次采样帧之间对球框做线性插值；间隔过大或开头/结尾空窗时，启用“持有最近框（hold）”作为回退。
+- 在两次采样帧之间使用前向卡尔曼滤波 + 反向 RTS 平滑对球框进行时序插值；当相邻观测间隔过大或开头/结尾空窗时，启用“持有最近框（hold）”作为回退。
 - 输出 `outputs/ball_overlay_full.mp4`。
 
 ---
 
 ## 📁 关键文件（当前精简版）
 - `detect_ball.py`：抽帧调用 Roboflow 球模型并缓存预测 + JSONL 汇总
-- `overlay_ball_full.py`：原始帧视频叠加，线性插值 + 可配置持有回退
+- `overlay_ball_full.py`：原始帧视频叠加，卡尔曼+RTS 平滑插值 + 可配置持有回退
+- `smoothing.py`：时序平滑模块（Kalman + RTS + 观测门控），供叠加与后续组件复用
 - `utils.py`：公共工具（读取 .env、保证目录存在、选择视频路径）
 - `roboflow_client.py`：Roboflow API 调用封装（独立模块，便于后续替换为其它提供方/本地模型）
 - `detect_court.py`：低频采样（默认每 5 秒）检测球场轮廓，按帧缓存 + 综合多次结果（中值 + EMA）生成精确四角点
@@ -114,6 +115,10 @@ python3 overlay_ball_full.py
 - `HOLD_MODE`: 回退持有策略 `prev|next|both|none`（默认 `prev`）
 - `HOLD_TTL_FRAMES`: 回退“持有最近框”的最大帧数（默认 30）
 - `OVERLAY_MIN_CONF`: 叠加时的最小置信度过滤（默认 0）
+  
+  平滑观测门控（Mahalanobis 距离）：
+  - `OBS_GATE_CHISQ_THRESH`: 卡方阈值（观测维度=4），默认 `18.4`（约等价于 3σ）
+  - `OBS_GATE_USE_CONF`: 是否按检测置信度自适应阈值（默认 `true`，低置信更严格）
 - Court 检测：
   - `COURT_INTERVAL_SEC`: 采样间隔秒（默认 5）
   - `COURT_INTERVAL_SEC_MIN`: 动态加密采样的最小间隔（默认 2）
