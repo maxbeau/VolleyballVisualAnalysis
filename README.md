@@ -93,6 +93,7 @@ python3 court_process.py --detections-jsonl outputs/court_detections.jsonl --tra
 - `smoothing_court.py`：角点 Kalman+RTS（x,y,vx,vy）独立滤波，支持 hold 回退
 - `roboflow_client.py`：Roboflow SDK 轻封装与网络设置
 - `utils.py`：读取 `.env`、保证目录存在、选择视频路径
+- `court_homography.py`：基于时序角点（tracking）计算单应性并生成鸟瞰图
  
 
 ---
@@ -122,3 +123,47 @@ python3 court_process.py --detections-jsonl outputs/court_detections.jsonl --tra
 - 插值：`MAX_INTERP_GAP_FRAMES` 控制遮挡段插值长度，过大可能漂移
 
 如需更多定制（ROI 过滤、单应透视、标准场地坐标系等），可在此基础上扩展。
+
+---
+
+## 🗺️ 单应性与鸟瞰图（推荐且唯一方案）
+
+仅使用“时序平滑后的角点”（`outputs/court_tracking.jsonl`）来估计稳定的单应性矩阵，并生成球场鸟瞰图：
+
+```bash
+python3 court_homography.py \
+  --tracking-jsonl outputs/court_tracking.jsonl \
+  --output-h-npy outputs/court_homography.npy \
+  --output-h-meta outputs/court_homography.json \
+  --birdseye-jpg outputs/court_birdseye.jpg \
+  --scale-px-per-meter 100  # 可选；默认 100px/m → 1800x900
+```
+
+说明：
+- 读取 `outputs/court_tracking.jsonl` 每帧角点，逐点取中位数，得到鲁棒的 TL,TR,BR,BL 再拟合 H。
+- 将 18m×9m 映射到 `scale_px_per_meter` 对应的画布（默认 1800×900）。
+- 保存单应性：`outputs/court_homography.npy`（3x3）与元数据 JSON。
+- 从原视频取一帧（默认中间帧）透视展开，得到 `outputs/court_birdseye.jpg`。
+- 如需固定像素尺寸，可用 `--model-size 1800x900` 覆盖比例参数。
+
+---
+
+## 🧭 轨迹到标准球场坐标系（连续与物理量）
+
+前置：已完成球场时序角点与单应性估计（上一节）。
+
+将平滑后的球中心映射到标准球场（鸟瞰）坐标系，并输出连续轨迹与速度等物理量：
+
+```bash
+python3 trajectory_analyze.py
+```
+
+输出：
+- `outputs/trajectory_world.jsonl`：逐帧世界坐标（像素与米）、速度、累计路程
+- `outputs/trajectory_world.csv`：同上 CSV 版本，便于表格/绘图分析
+- `outputs/trajectory_birdseye.jpg`：在鸟瞰图上绘制的轨迹折线（绿色起点、红色终点）
+
+要点：
+- 先在图像坐标系内用 Kalman+RTS 融合（含可选重力外推/观测门控/hold 回退），再用单应性投影到球场平面；
+- 可选在球场坐标内再次做 2D 时序平滑（常速度模型），使轨迹更连续；
+- 米制换算依据 `court_homography.json` 的 `scale_px_per_meter`，默认 100px/m（18m×9m→1800×900）。

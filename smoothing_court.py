@@ -152,3 +152,34 @@ def smooth_corners_timeseries(
                 out[f] = last_ok
     return out
 
+
+def smooth_xy_timeseries(
+    samples: Dict[int, Tuple[float, float]],
+    total_frames: int,
+    q_var: float = 400.0,
+    r_var: float = 36.0,
+    hold_ttl: int = 0,
+) -> Dict[int, Tuple[float, float]]:
+    """
+    Smooth a single 2D point timeseries over frames [0, total_frames-1]
+    using a constant-velocity Kalman + RTS model.
+    Fills frames with hold-back if configured and nearby valid frames exist.
+    """
+    if not samples:
+        return {}
+    first = 0
+    last = max(0, total_frames - 1)
+    sm = _kalman_rts_2d(samples, first, last, q_var, r_var)
+    if hold_ttl <= 0:
+        return sm
+    out: Dict[int, Tuple[float, float]] = dict(sm)
+    last_ok: Optional[Tuple[float, float]] = None
+    last_ok_frame: Optional[int] = None
+    for f in range(first, last + 1):
+        if f in sm:
+            last_ok = sm[f]
+            last_ok_frame = f
+            continue
+        if last_ok is not None and last_ok_frame is not None and (f - last_ok_frame) <= hold_ttl:
+            out[f] = last_ok
+    return out
