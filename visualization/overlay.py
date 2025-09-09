@@ -4,8 +4,9 @@ import bisect
 import cv2
 import math
 from typing import Dict, Any, List, Optional, Tuple
-from utils import load_env_file, ensure_dir, pick_video_path
-from smoothing import kalman_rts_smooth
+from core.config import settings
+from core.utils import ensure_dir
+from analysis.smoothing import kalman_rts_smooth
 
 
 def to_tlbr_from_xywh(x: float, y: float, w: float, h: float) -> Tuple[int, int, int, int]:
@@ -96,29 +97,28 @@ def pred_with_kalman_or_hold(
 
 
 def main():
-    env = load_env_file()
-    jsonl_path = env.get("COMBINED_JSONL", "outputs/ball_detections.jsonl")
-    out_path = env.get("BALL_OVERLAY_FULL", "outputs/ball_overlay_full.mp4")
-    max_gap_frames = int(env.get("MAX_INTERP_GAP_FRAMES", 60))
-    hold_mode = env.get("HOLD_MODE", "prev")
-    hold_ttl = int(env.get("HOLD_TTL_FRAMES", 30))
-    allowed = [c.strip() for c in env.get("BALL_CLASSES", "ball,volleyball").split(",")]
-    min_conf = float(env.get("OVERLAY_MIN_CONF", 0.0))
+    jsonl_path = settings.BALL_DETECTIONS_JSONL
+    out_path = settings.BALL_OVERLAY_FULL
+    max_gap_frames = settings.MAX_INTERP_GAP_FRAMES
+    hold_mode = "prev" if settings.HOLD_MODE else "none"
+    hold_ttl = settings.HOLD_TTL_FRAMES
+    allowed = ["ball", "volleyball"]
+    min_conf = settings.OVERLAY_MIN_CONF
     color = (0, 255, 0)
     thickness = 2
-    show_labels = parse_bool(env.get("SHOW_BOX_LABELS", "true"), True)
+    show_labels = settings.SHOW_BOX_LABELS
     # Court overlay config
-    court_overlay = parse_bool(env.get("COURT_OVERLAY", "false"), False)
-    court_json = env.get("COURT_INTEGRATED_JSON", "outputs/court_corners_integrated.json")
-    court_tracking_jsonl = env.get("COURT_TRACKING_JSONL", "outputs/court_tracking.jsonl")
-    court_method = (env.get("COURT_OVERLAY_METHOD", "median") or "median").lower()
-    court_color = parse_color(env.get("COURT_COLOR", "0,200,255"), (0, 200, 255))
-    court_thickness = int(env.get("COURT_THICKNESS", 2))
+    court_overlay = settings.COURT_OVERLAY
+    court_json = "outputs/court_corners_integrated.json"
+    court_tracking_jsonl = settings.COURT_TRACKING_JSONL
+    court_method = settings.COURT_OVERLAY_METHOD
+    court_color = settings.COURT_COLOR
+    court_thickness = settings.COURT_THICKNESS
 
     if not os.path.exists(jsonl_path):
         raise FileNotFoundError(f"JSONL not found: {jsonl_path}. Run detect_ball.py first.")
 
-    video_path, _ = pick_video_path(env)
+    video_path = settings.VIDEO_PATH
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -137,7 +137,7 @@ def main():
         resize_needed = False
 
     ensure_dir(os.path.dirname(out_path) or ".")
-    codec = env.get("OVERLAY_CODEC", "avc1")
+    codec = settings.OVERLAY_CODEC
     fourcc = cv2.VideoWriter_fourcc(*codec)
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
@@ -149,9 +149,9 @@ def main():
     best = load_best_ball_per_frame(jsonl_path, allowed)
 
     # Aspect-ratio soft weighting (no size constraints)
-    f_min_ar = float(env.get("FILTER_MIN_ASPECT_RATIO", 0.7) or 0.7)
-    f_max_ar = float(env.get("FILTER_MAX_ASPECT_RATIO", 1.3) or 1.3)
-    ar_alpha = float(env.get("FILTER_AR_SOFT_ALPHA", 4.0) or 4.0)
+    f_min_ar = settings.FILTER_MIN_ASPECT_RATIO
+    f_max_ar = settings.FILTER_MAX_ASPECT_RATIO
+    ar_alpha = settings.FILTER_AR_SOFT_ALPHA
     adjusted = {}
     softened = 0
     for k, p in best.items():
@@ -183,10 +183,10 @@ def main():
     best = adjusted
     frames_with_pred = sorted(best.keys())
     # Observation gating configuration
-    gate_chisq = float(env.get("OBS_GATE_CHISQ_THRESH", 18.4))
-    gate_use_conf = parse_bool(env.get("OBS_GATE_USE_CONF", "true"), True)
+    gate_chisq = settings.OBS_GATE_CHISQ_THRESH
+    gate_use_conf = settings.OBS_GATE_USE_CONF
     # Gravity configuration (pixels per second squared)
-    gravity_pps2 = float(env.get("GRAVITY_PPS2", 0.0) or 0.0)
+    gravity_pps2 = settings.GRAVITY_PPS2
     # Convert to per-frame acceleration: g / fps^2
     gravity_per_frame = (gravity_pps2 / (fps * fps)) if fps and fps > 0 else 0.0
     smoothed = kalman_rts_smooth(

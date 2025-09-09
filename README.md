@@ -19,14 +19,20 @@
 - Python 3.9+（推荐 3.10+）
 - 安装依赖：
 ```bash
+# 创建并激活虚拟环境
 python3 -m venv .venv && source .venv/bin/activate
-pip install inference-sdk opencv-python numpy
+
+# 使用 requirements.txt 安装所有依赖
+pip install -r requirements.txt
 ```
+说明：`requirements.txt` 包含 `inference-sdk`, `opencv-python`, `numpy`, `python-dotenv` 等所有必需的库。
 
 ---
 
 ## 🔑 配置与路径
-- 在根目录创建/编辑 `.env`，已包含示例条目。
+- 在根目录创建/编辑 `.env` 文件以配置项目（如 `ROBOFLOW_API_KEY`）。
+- 所有可调参数均通过 `.env` 文件管理，由 `core/config.py` 统一加载。
+- **视频路径**：如果 `.env` 中未设置 `VIDEO_PATH`，程序会自动查找并使用 `data/input.mov` 或 `data/input.mp4`。
 - 关键路径默认值：
   - 检测缓存：`outputs/preds/`（JPEG+JSON）
   - 检测汇总：`outputs/ball_detections.jsonl`
@@ -45,9 +51,9 @@ pip install inference-sdk opencv-python numpy
 
 ## ▶️ 快速开始
 
-1) 视频抽帧检测（仅球模型，内存推理）：`detect_ball.py`
+1) 视频抽帧检测（仅球模型，内存推理）：
 ```bash
-python3 detect_ball.py
+python3 scripts/run_ball_detect.py
 ```
 说明：
 - 读取 `.env` 的 `ROBOFLOW_API_KEY`，使用模型 `volleyball_v2/3`。
@@ -55,9 +61,9 @@ python3 detect_ball.py
 - 如需保留缓存，可设置：`BALL_SAVE_JPEGS=true`、`BALL_SAVE_FRAME_JSON=true`。
 - 合并输出 `outputs/ball_detections.jsonl`（每行一个帧的预测）。
 
-2) 原始帧完整叠加 + 卡尔曼/RTS 平滑：`overlay_ball_full.py`
+2) 原始帧完整叠加 + 卡尔曼/RTS 平滑：
 ```bash
-python3 overlay_ball_full.py
+python3 scripts/run_overlay.py
 ```
 说明：
 - 逐帧读取原视频（保持原始帧率与时长）。
@@ -67,13 +73,13 @@ python3 overlay_ball_full.py
 
 3) 场地“采集-处理”解耦与动态跟踪（推荐）：
 
-- 采集（仅云推理与缓存，不做融合）：`court_capture.py`
+- 采集（仅云推理与缓存，不做融合）：
 ```bash
-python3 court_capture.py
+python3 scripts/run_court_detect.py
 ```
-- 处理（Kalman+RTS 平滑与逐帧插值）：`court_process.py`
+- 处理（Kalman+RTS 平滑与逐帧插值）：
 ```bash
-python3 court_process.py --detections-jsonl outputs/court_detections.jsonl --tracking-jsonl outputs/court_tracking.jsonl
+python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detections.jsonl --tracking-jsonl outputs/court_tracking.jsonl
 ```
 说明：
 - 采集阶段专注于按时间间隔抽帧并保存“原始预测+角点”，形成可复用数据资产（JSONL+缓存帧）。
@@ -84,16 +90,17 @@ python3 court_process.py --detections-jsonl outputs/court_detections.jsonl --tra
 ---
 
 ## 📁 关键文件
-- `detect_ball.py`：Roboflow 抽帧检测、缓存与 JSONL 汇总
-- `overlay_ball_full.py`：叠加渲染（Kalman+RTS、软权重、重力、可选场地）
-- `smoothing.py`：Kalman + RTS 平滑、观测门控与重力注入
-- `court_utils.py`：球场几何工具（角点解析与排序）
-- `court_capture.py`：仅采集球场检测结果（抽样帧 JPEG+原始 JSON、合并 JSONL）
-- `court_process.py`：角点时序平滑与插值，输出逐帧 `court_tracking.jsonl`
-- `smoothing_court.py`：角点 Kalman+RTS（x,y,vx,vy）独立滤波，支持 hold 回退
-- `roboflow_client.py`：Roboflow SDK 轻封装与网络设置
-- `utils.py`：读取 `.env`、保证目录存在、选择视频路径
-- `court_homography.py`：基于时序角点（tracking）计算单应性并生成鸟瞰图
+- `ball/detect.py`：Roboflow 抽帧检测、缓存与 JSONL 汇总
+- `visualization/overlay.py`：叠加渲染（Kalman+RTS、软权重、重力、可选场地）
+- `analysis/smoothing.py`：Kalman + RTS 平滑、观测门控与重力注入
+- `court/utils.py`：球场几何工具（角点解析与排序）
+- `court/detect.py`：仅采集球场检测结果（抽样帧 JPEG+原始 JSON、合并 JSONL）
+- `court/processing.py`：角点时序平滑与插值，输出逐帧 `court_tracking.jsonl`
+- `court/smoothing.py`：角点 Kalman+RTS（x,y,vx,vy）独立滤波，支持 hold 回退
+- `core/roboflow_client.py`：Roboflow SDK 轻封装与网络设置
+- `core/utils.py`：读取 `.env`、保证目录存在、选择视频路径
+- `court/homography.py`：基于时序角点（tracking）计算单应性并生成鸟瞰图
+- `analysis/trajectory.py`：融合球轨迹与单应性，计算世界坐标与物理量
  
 
 ---
@@ -131,7 +138,7 @@ python3 court_process.py --detections-jsonl outputs/court_detections.jsonl --tra
 仅使用“时序平滑后的角点”（`outputs/court_tracking.jsonl`）来估计稳定的单应性矩阵，并生成球场鸟瞰图：
 
 ```bash
-python3 court_homography.py \
+python3 scripts/run_court_homography.py \
   --tracking-jsonl outputs/court_tracking.jsonl \
   --output-h-npy outputs/court_homography.npy \
   --output-h-meta outputs/court_homography.json \
@@ -155,7 +162,7 @@ python3 court_homography.py \
 将平滑后的球中心映射到标准球场（鸟瞰）坐标系，并输出连续轨迹与速度等物理量：
 
 ```bash
-python3 trajectory_analyze.py
+python3 scripts/run_trajectory_analysis.py
 ```
 
 输出：

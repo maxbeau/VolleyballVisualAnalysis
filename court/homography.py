@@ -6,8 +6,9 @@ from typing import Tuple, Optional
 import numpy as np
 import cv2
 
-from utils import load_env_file, pick_video_path, ensure_dir
-from court_utils import (
+from core.config import settings
+from core.utils import ensure_dir
+from court.utils import (
     median_corners_from_tracking,
     compute_homography,
     standard_court_model_size,
@@ -75,16 +76,14 @@ def generate_birdseye_image(
 
 
 def main():
-    env = load_env_file()
-
     parser = argparse.ArgumentParser(description="Compute and save homography for volleyball court and output a bird's-eye image")
-    parser.add_argument("--tracking-jsonl", default=env.get("COURT_TRACKING_JSONL", "outputs/court_tracking.jsonl"))
-    parser.add_argument("--output-h-npy", default=env.get("COURT_H_NPY", "outputs/court_homography.npy"))
-    parser.add_argument("--output-h-meta", default=env.get("COURT_H_JSON", "outputs/court_homography.json"))
-    parser.add_argument("--birdseye-jpg", default=env.get("COURT_BIRDSEYE_JPG", "outputs/court_birdseye.jpg"))
+    parser.add_argument("--tracking-jsonl", default=settings.COURT_TRACKING_JSONL)
+    parser.add_argument("--output-h-npy", default="outputs/court_homography.npy")
+    parser.add_argument("--output-h-meta", default="outputs/court_homography.json")
+    parser.add_argument("--birdseye-jpg", default="outputs/court_birdseye.jpg")
     parser.add_argument("--birdseye-frame", type=int, default=None)
-    parser.add_argument("--scale-px-per-meter", type=float, default=float(env.get("COURT_SCALE_PX_PER_M", 100.0)))
-    parser.add_argument("--model-size", default=env.get("COURT_MODEL_SIZE", ""), help="Override model size as WxH, e.g. 1800x900")
+    parser.add_argument("--scale-px-per-meter", type=float, default=100.0)
+    parser.add_argument("--model-size", default="", help="Override model size as WxH, e.g. 1800x900")
     args = parser.parse_args()
 
     model_size: Optional[Tuple[int, int]] = None
@@ -103,7 +102,7 @@ def main():
         scale_px_per_meter=args.scale_px_per_meter,
     )
 
-    video_path, _ = pick_video_path(env)
+    video_path = settings.VIDEO_PATH
     generate_birdseye_image(
         video_path=video_path,
         H=H,

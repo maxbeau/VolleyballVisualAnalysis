@@ -5,8 +5,9 @@ from typing import Dict, Any, List, Tuple
 
 import cv2
 
-from utils import load_env_file, pick_video_path, ensure_dir
-from smoothing_court import smooth_corners_timeseries
+from core.config import settings
+from core.utils import ensure_dir
+from court.smoothing import smooth_corners_timeseries
 
 
 def load_court_samples(jsonl_path: str) -> Dict[int, List[Tuple[float, float]]]:
@@ -36,8 +37,7 @@ def process_court(
     r_var: float,
     hold_ttl: int,
 ) -> None:
-    env = load_env_file()
-    video_path, _ = pick_video_path(env)
+    video_path = settings.VIDEO_PATH
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -55,12 +55,11 @@ def process_court(
 
 
 def main():
-    env = load_env_file()
-    detections_jsonl = env.get("COURT_COMBINED_JSONL", "outputs/court_detections.jsonl")
-    tracking_jsonl = env.get("COURT_TRACKING_JSONL", "outputs/court_tracking.jsonl")
-    q_var = float(env.get("COURT_Q_VAR", 400.0))
-    r_var = float(env.get("COURT_R_VAR", 36.0))
-    hold_ttl = int(env.get("COURT_HOLD_TTL_FRAMES", 0))
+    detections_jsonl = settings.COURT_DETECTIONS_JSONL
+    tracking_jsonl = settings.COURT_TRACKING_JSONL
+    q_var = 400.0
+    r_var = 36.0
+    hold_ttl = 0
 
     parser = argparse.ArgumentParser(description="Process court detections into per-frame tracking (Kalman+RTS)")
     parser.add_argument("--detections-jsonl", default=detections_jsonl)

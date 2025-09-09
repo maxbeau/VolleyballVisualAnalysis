@@ -1,5 +1,6 @@
 import numpy as np
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
+from analysis.kalman import KalmanRTS
 
 
 def _kalman_rts_2d(
@@ -12,12 +13,16 @@ def _kalman_rts_2d(
     if last < first:
         return {}
     n = (last - first) + 1
+    
+    # --- Kalman Model Setup ---
     F = np.eye(4, dtype=float)
     F[0, 2] = 1.0
     F[1, 3] = 1.0
+    
     H = np.zeros((2, 4), dtype=float)
     H[0, 0] = 1.0
     H[1, 1] = 1.0
+    
     Q = np.zeros((4, 4), dtype=float)
     Q[0, 0] = 0.25 * q_var
     Q[0, 2] = 0.5 * q_var
@@ -25,85 +30,42 @@ def _kalman_rts_2d(
     Q[1, 3] = 0.5 * q_var
     Q[2, 2] = q_var
     Q[3, 3] = q_var
+    
     R = np.eye(2, dtype=float) * r_var
-    I = np.eye(4, dtype=float)
+    smoother = KalmanRTS(F, H, Q, R)
 
-    first_meas_idx = None
+    # --- Prepare Measurements ---
+    measurements: List[Optional[np.ndarray]] = [None] * n
+    first_meas_idx_local = -1
+    first_meas_frame = -1
+
     for f in range(first, last + 1):
         if f in meas:
-            first_meas_idx = f
-            break
-    if first_meas_idx is None:
+            j = f - first
+            measurements[j] = np.array(meas[f], dtype=float).reshape(2, 1)
+            if first_meas_idx_local == -1:
+                first_meas_idx_local = j
+                first_meas_frame = f
+    
+    if first_meas_idx_local == -1:
         return {}
+
+    # --- Initial State ---
     x0 = np.zeros((4, 1), dtype=float)
-    x0[0, 0] = meas[first_meas_idx][0]
-    x0[1, 0] = meas[first_meas_idx][1]
+    x0[0:2, 0] = measurements[first_meas_idx_local].flatten()
     P0 = np.diag([100.0, 100.0, 400.0, 400.0]).astype(float)
 
-    x_pred: List[Optional[np.ndarray]] = [None] * n
-    P_pred: List[Optional[np.ndarray]] = [None] * n
-    x_filt: List[Optional[np.ndarray]] = [None] * n
-    P_filt: List[Optional[np.ndarray]] = [None] * n
+    # --- Run Smoother ---
+    x_smooth, _ = smoother.smooth(measurements, x0, P0)
 
-    x_prev = x0
-    P_prev = P0
-    for f in range(first, last + 1):
-        j = f - first
-        x_pr = F @ x_prev
-        P_pr = F @ P_prev @ F.T + Q
-        if f in meas:
-            z = np.array([[meas[f][0]], [meas[f][1]]], dtype=float)
-            y = z - (H @ x_pr)
-            S = H @ P_pr @ H.T + R
-            S += 1e-6 * np.eye(2)
-            try:
-                S_inv = np.linalg.inv(S)
-            except np.linalg.LinAlgError:
-                S_inv = np.linalg.pinv(S)
-            K = P_pr @ H.T @ S_inv
-            x_upd = x_pr + K @ y
-            P_upd = (I - K @ H) @ P_pr
-        else:
-            x_upd, P_upd = x_pr, P_pr
-        x_pred[j], P_pred[j] = x_pr, P_pr
-        x_filt[j], P_filt[j] = x_upd, P_upd
-        x_prev, P_prev = x_upd, P_upd
-
-    last_meas_idx = None
-    for f in range(last, first - 1, -1):
-        if f in meas:
-            last_meas_idx = f
-            break
-    if last_meas_idx is None:
-        last_meas_idx = last
-
-    x_smooth: List[Optional[np.ndarray]] = [None] * n
-    P_smooth: List[Optional[np.ndarray]] = [None] * n
-    j_last = last - first
-    x_smooth[j_last] = x_filt[j_last]
-    P_smooth[j_last] = P_filt[j_last]
-    for j in range(j_last - 1, -1, -1):
-        if x_filt[j] is None:
-            x_smooth[j] = x_filt[j]
-            P_smooth[j] = P_filt[j]
-            continue
-        Pj = P_filt[j]
-        Pj1_pr = P_pred[j + 1]
-        if Pj1_pr is None:
-            x_smooth[j] = x_filt[j]
-            P_smooth[j] = P_filt[j]
-            continue
-        J = Pj @ F.T @ np.linalg.inv(Pj1_pr)
-        x_smooth[j] = x_filt[j] + J @ (x_smooth[j + 1] - x_pred[j + 1])
-        P_smooth[j] = Pj + J @ (P_smooth[j + 1] - Pj1_pr) @ J.T
-
+    # --- Format Output ---
     out: Dict[int, Tuple[float, float]] = {}
     for f in range(first, last + 1):
         j = f - first
-        xs = x_smooth[j] if x_smooth[j] is not None else x_filt[j]
-        if xs is None:
-            continue
-        out[f] = (float(xs[0, 0]), float(xs[1, 0]))
+        xs = x_smooth[j]
+        if xs is not None:
+            out[f] = (float(xs[0, 0]), float(xs[1, 0]))
+            
     return out
 
 

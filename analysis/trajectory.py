@@ -6,10 +6,11 @@ from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import cv2
 
-from utils import load_env_file, pick_video_path, ensure_dir
-from smoothing import kalman_rts_smooth
-from smoothing_court import smooth_xy_timeseries
-from court_utils import apply_homography_points
+from core.config import settings
+from core.utils import ensure_dir
+from analysis.smoothing import kalman_rts_smooth
+from court.smoothing import smooth_xy_timeseries
+from court.utils import apply_homography_points
 
 
 def parse_bool(s: Optional[str], default: bool = False) -> bool:
@@ -42,10 +43,10 @@ def load_best_ball_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dic
     return best
 
 
-def soft_weight_aspect_ratio(best: Dict[int, Dict[str, Any]], env: Dict[str, str]) -> Dict[int, Dict[str, Any]]:
-    f_min_ar = float(env.get("FILTER_MIN_ASPECT_RATIO", 0.7) or 0.7)
-    f_max_ar = float(env.get("FILTER_MAX_ASPECT_RATIO", 1.3) or 1.3)
-    ar_alpha = float(env.get("FILTER_AR_SOFT_ALPHA", 4.0) or 4.0)
+def soft_weight_aspect_ratio(best: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    f_min_ar = settings.FILTER_MIN_ASPECT_RATIO
+    f_max_ar = settings.FILTER_MAX_ASPECT_RATIO
+    ar_alpha = settings.FILTER_AR_SOFT_ALPHA
     adjusted: Dict[int, Dict[str, Any]] = {}
     for k, p in best.items():
         q = p.copy()
@@ -105,29 +106,15 @@ def pred_with_kalman_or_hold(
 
 
 def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
-    env = load_env_file()
-    # Allow runtime overrides for two-step relevant keys only
-    for k in [
-        "WORLD_MEAS_POINT",
-        "WORLD_BOTTOM_ALPHA",
-        "MAX_INTERP_GAP_FRAMES",
-        "OBS_GATE_CHISQ_THRESH",
-        "OBS_GATE_USE_CONF",
-        "HOLD_MODE",
-        "HOLD_TTL_FRAMES",
-    ]:
-        if k in os.environ:
-            env[k] = os.environ[k]
-
     # IO and config
-    detections_jsonl = env.get("COMBINED_JSONL", "outputs/ball_detections.jsonl")
-    H_npy = env.get("COURT_H_NPY", "outputs/court_homography.npy")
-    H_meta_json = env.get("COURT_H_JSON", "outputs/court_homography.json")
-    base_jsonl = env.get("TRAJ_WORLD_JSONL", "outputs/trajectory_world.jsonl")
-    base_csv = env.get("TRAJ_WORLD_CSV", "outputs/trajectory_world.csv")
-    base_img = env.get("TRAJ_BIRDSEYE_IMG", "outputs/trajectory_birdseye.jpg")
+    detections_jsonl = settings.BALL_DETECTIONS_JSONL
+    H_npy = "outputs/court_homography.npy"
+    H_meta_json = "outputs/court_homography.json"
+    base_jsonl = "outputs/trajectory_world.jsonl"
+    base_csv = "outputs/trajectory_world.csv"
+    base_img = "outputs/trajectory_birdseye.jpg"
     # Apply optional suffix to avoid overwrite
-    suffix_env = env.get("TRAJ_SUFFIX", "")
+    suffix_env = ""
     suffix = suffix_cli or suffix_env or ""
     def with_suffix(path: str) -> str:
         if not suffix:
@@ -143,7 +130,7 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
     ensure_dir(os.path.dirname(out_path_img) or ".")
 
     # Load video/fps
-    video_path, _ = pick_video_path(env)
+    video_path = settings.VIDEO_PATH
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -160,23 +147,23 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
     with open(H_meta_json, "r", encoding="utf-8") as f:
         H_meta = json.load(f)
     dst_size = (int(H_meta.get("dst_size", {}).get("w", 1800)), int(H_meta.get("dst_size", {}).get("h", 900)))
-    px_per_m = float(H_meta.get("scale_px_per_meter", env.get("COURT_SCALE_PX_PER_M", 100.0)))
+    px_per_m = float(H_meta.get("scale_px_per_meter", 100.0))
 
     # Load detections and choose per-frame best
-    allowed = [c.strip() for c in env.get("BALL_CLASSES", "ball,volleyball").split(",")]
+    allowed = ["ball", "volleyball"]
     best = load_best_ball_per_frame(detections_jsonl, allowed)
-    best = soft_weight_aspect_ratio(best, env)
+    best = soft_weight_aspect_ratio(best)
     frames_with_pred = sorted(best.keys())
 
     # Two-step only (image-space smoothing -> map -> optional light world smoothing)
     strategy = "two_step"
-    min_conf = float(env.get("OVERLAY_MIN_CONF", 0.0))
+    min_conf = settings.OVERLAY_MIN_CONF
 
     # 1) Build raw observations (no image-space smoothing)
     img_xy_meas: Dict[int, Tuple[float, float]] = {}
     confs: Dict[int, float] = {}
-    meas_point = (env.get("WORLD_MEAS_POINT", "center") or "center").lower()
-    bottom_alpha = float(env.get("WORLD_BOTTOM_ALPHA", 1.0) or 1.0)
+    meas_point = "center"
+    bottom_alpha = 1.0
     for f in frames_with_pred:
         p = best[f]
         c = float(p.get("confidence", 0.0))
@@ -214,10 +201,10 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
 
     if strategy == "two_step":
         # First: image-space smoothing (with gating/gravity/hold)
-        max_gap_frames = int(env.get("MAX_INTERP_GAP_FRAMES", 60))
-        gate_chisq = float(env.get("OBS_GATE_CHISQ_THRESH", 18.4))
-        gate_use_conf = parse_bool(env.get("OBS_GATE_USE_CONF", "true"), True)
-        gravity_pps2 = float(env.get("GRAVITY_PPS2", 0.0) or 0.0)
+        max_gap_frames = settings.MAX_INTERP_GAP_FRAMES
+        gate_chisq = settings.OBS_GATE_CHISQ_THRESH
+        gate_use_conf = settings.OBS_GATE_USE_CONF
+        gravity_pps2 = settings.GRAVITY_PPS2
         gravity_per_frame = (gravity_pps2 / (fps * fps)) if fps and fps > 0 else 0.0
         smoothed_img = kalman_rts_smooth(
             best,
@@ -226,8 +213,8 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
             gate_use_conf,
             gravity_per_frame=gravity_per_frame,
         )
-        hold_mode = env.get("HOLD_MODE", "prev")
-        hold_ttl = int(env.get("HOLD_TTL_FRAMES", 30))
+        hold_mode = "prev"
+        hold_ttl = settings.HOLD_TTL_FRAMES
         # Fill per-frame predictions via smoothed+hold
         img_xy_full: Dict[int, Tuple[float, float]] = {}
         flags: Dict[int, Dict[str, bool]] = {}
@@ -246,9 +233,9 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
             for f, (wx, wy) in zip(frames_sorted_2, mapped_2):
                 world_xy_meas[f] = (wx, wy)
         # Optional light smoothing in world plane for de-noising
-        world_q_var = float(env.get("WORLD_Q_VAR", 200.0))
-        world_r_var = float(env.get("WORLD_R_VAR", 16.0))
-        world_hold_ttl = int(env.get("WORLD_HOLD_TTL", 0))
+        world_q_var = 200.0
+        world_r_var = 16.0
+        world_hold_ttl = 0
         world_xy = smooth_xy_timeseries(world_xy_meas, total_frames, q_var=world_q_var, r_var=world_r_var, hold_ttl=world_hold_ttl)
 
     # Derive kinematics in meters
@@ -320,7 +307,7 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
     # Draw a bird's-eye path image
     bg = None
     # Prefer previously generated bird's-eye frame if present
-    bird_path = env.get("COURT_BIRDSEYE_JPG", "outputs/court_birdseye.jpg")
+    bird_path = "outputs/court_birdseye.jpg"
     if os.path.exists(bird_path):
         bg = cv2.imread(bird_path)
     if bg is None:
