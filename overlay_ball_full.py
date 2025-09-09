@@ -2,6 +2,7 @@ import os
 import json
 import bisect
 import cv2
+import math
 from typing import Dict, Any, List, Optional, Tuple
 from utils import load_env_file, ensure_dir, pick_video_path
 from smoothing import kalman_rts_smooth
@@ -54,12 +55,6 @@ def load_best_ball_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dic
             if cand is not None:
                 best[frame_idx] = cand
     return best
-
-
-def build_interpolator(best: Dict[int, Dict[str, Any]], max_gap_frames: int) -> Tuple[List[int], Dict[int, Dict[str, Any]]]:
-    # Deprecated; kept for compatibility if other modules import it
-    frames = sorted(best.keys())
-    return frames, best
 
 
 def pred_with_kalman_or_hold(
@@ -115,6 +110,7 @@ def main():
     # Court overlay config
     court_overlay = parse_bool(env.get("COURT_OVERLAY", "false"), False)
     court_json = env.get("COURT_INTEGRATED_JSON", "outputs/court_corners_integrated.json")
+    court_tracking_jsonl = env.get("COURT_TRACKING_JSONL", "outputs/court_tracking.jsonl")
     court_method = (env.get("COURT_OVERLAY_METHOD", "median") or "median").lower()
     court_color = parse_color(env.get("COURT_COLOR", "0,200,255"), (0, 200, 255))
     court_thickness = int(env.get("COURT_THICKNESS", 2))
@@ -151,28 +147,87 @@ def main():
         out_path = alt_path
 
     best = load_best_ball_per_frame(jsonl_path, allowed)
+
+    # Aspect-ratio soft weighting (no size constraints)
+    f_min_ar = float(env.get("FILTER_MIN_ASPECT_RATIO", 0.7) or 0.7)
+    f_max_ar = float(env.get("FILTER_MAX_ASPECT_RATIO", 1.3) or 1.3)
+    ar_alpha = float(env.get("FILTER_AR_SOFT_ALPHA", 4.0) or 4.0)
+    adjusted = {}
+    softened = 0
+    for k, p in best.items():
+        q = p.copy()
+        try:
+            w = float(q.get("width", 0.0))
+            h = float(q.get("height", 0.0))
+            ar = (w / h) if h > 0 else 0.0
+            conf = float(q.get("confidence", 0.0))
+            weight = 1.0
+            if ar <= 0.0:
+                weight = 0.5  # uncertain, down-weight a bit
+            elif ar < f_min_ar:
+                t = (f_min_ar - ar) / max(f_min_ar, 1e-6)
+                weight = float(math.exp(-ar_alpha * t))
+            elif ar > f_max_ar:
+                t = (ar - f_max_ar) / max(f_max_ar, 1e-6)
+                weight = float(math.exp(-ar_alpha * t))
+            # Apply weight softly on confidence
+            if weight < 1.0:
+                q["confidence"] = max(0.0, min(1.0, conf * weight))
+                q["_ar_weight"] = round(weight, 3)
+                softened += 1
+        except Exception:
+            pass
+        adjusted[k] = q
+    if softened > 0:
+        print(f"AR soft-weight: adjusted {softened} frames by aspect-ratio; total {len(adjusted)}")
+    best = adjusted
     frames_with_pred = sorted(best.keys())
     # Observation gating configuration
     gate_chisq = float(env.get("OBS_GATE_CHISQ_THRESH", 18.4))
     gate_use_conf = parse_bool(env.get("OBS_GATE_USE_CONF", "true"), True)
-    smoothed = kalman_rts_smooth(best, max_gap_frames, gate_chisq, gate_use_conf)
+    # Gravity configuration (pixels per second squared)
+    gravity_pps2 = float(env.get("GRAVITY_PPS2", 0.0) or 0.0)
+    # Convert to per-frame acceleration: g / fps^2
+    gravity_per_frame = (gravity_pps2 / (fps * fps)) if fps and fps > 0 else 0.0
+    smoothed = kalman_rts_smooth(
+        best,
+        max_gap_frames,
+        gate_chisq,
+        gate_use_conf,
+        gravity_per_frame=gravity_per_frame,
+    )
 
     drawn = 0
     interp_count = 0
     hold_count = 0
 
-    # Load court corners once (static court assumption)
+    # Load court overlay source
     court_corners: Optional[List[Tuple[float, float]]] = None
-    if court_overlay and os.path.exists(court_json):
-        try:
-            with open(court_json, "r", encoding="utf-8") as cf:
-                cdata = json.load(cf)
-            if court_method == "ema" and cdata.get("ema"):
-                court_corners = [(float(x), float(y)) for x, y in cdata["ema"]]
-            elif cdata.get("median"):
-                court_corners = [(float(x), float(y)) for x, y in cdata["median"]]
-        except Exception:
-            court_corners = None
+    court_timeseries: Optional[Dict[int, List[Tuple[float, float]]]] = None
+    if court_overlay:
+        if court_method == "timeseries" and os.path.exists(court_tracking_jsonl):
+            court_timeseries = {}
+            with open(court_tracking_jsonl, "r", encoding="utf-8") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    fi = int(rec.get("frame", -1))
+                    cs = rec.get("corners")
+                    if fi >= 0 and cs and isinstance(cs, list) and len(cs) >= 4:
+                        pts = [(float(cs[0][0]), float(cs[0][1])), (float(cs[1][0]), float(cs[1][1])), (float(cs[2][0]), float(cs[2][1])), (float(cs[3][0]), float(cs[3][1]))]
+                        court_timeseries[fi] = pts
+        elif os.path.exists(court_json):
+            try:
+                with open(court_json, "r", encoding="utf-8") as cf:
+                    cdata = json.load(cf)
+                if court_method == "ema" and cdata.get("ema"):
+                    court_corners = [(float(x), float(y)) for x, y in cdata["ema"]]
+                elif cdata.get("median"):
+                    court_corners = [(float(x), float(y)) for x, y in cdata["median"]]
+            except Exception:
+                court_corners = None
     i = 0
     while True:
         ok, frame = cap.read()
@@ -198,9 +253,13 @@ def main():
                 cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
             drawn += 1
 
-        # Draw court if available
-        if court_corners is not None and len(court_corners) == 4:
+        # Draw court
+        pts: Optional[List[Tuple[float, float]]] = None
+        if court_timeseries is not None and i in court_timeseries:
+            pts = court_timeseries.get(i)
+        elif court_corners is not None and len(court_corners) == 4:
             pts = court_corners
+        if pts is not None and len(pts) == 4:
             # Order should be TL, TR, BR, BL; connect in order and close
             pairs = [(0, 1), (1, 2), (2, 3), (3, 0)]
             for a, b in pairs:

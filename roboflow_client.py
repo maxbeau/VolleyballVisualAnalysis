@@ -30,3 +30,12 @@ class RoboflowClient:
             except Exception:
                 pass
         return self._client.infer(image_path, model_id=model_id)
+
+    def infer_frame(self, frame, model_id: str, confidence: Optional[float] = None) -> Dict[str, Any]:
+        """Run inference directly on a NumPy frame to avoid disk I/O."""
+        if confidence is not None:
+            try:
+                self._client.inference_configuration.confidence_threshold = float(confidence)
+            except Exception:
+                pass
+        return self._client.infer(frame, model_id=model_id)

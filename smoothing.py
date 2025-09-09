@@ -7,6 +7,7 @@ def kalman_rts_smooth(
     max_gap_frames: int,
     gate_chisq_thresh: float = 18.4,
     gate_use_conf: bool = True,
+    gravity_per_frame: float = 0.0,
 ) -> Dict[int, Dict[str, Any]]:
     """
     Forward Kalman filter + backward RTS smoother over [first,last] observed frames.
@@ -107,59 +108,43 @@ def kalman_rts_smooth(
     x_prev = x0
     P_prev = P0
     for j in range(M):
-        if j == first_idx:
-            x_pr = F @ x_prev
-            P_pr = F @ P_prev @ F.T + Q
-            if has_meas[j]:
-                y = (z[j].reshape(4, 1) - (H @ x_pr))
-                S = H @ P_pr @ H.T + R
-                S = S + 1e-6 * np.eye(4)
-                K = P_pr @ H.T @ np.linalg.inv(S)
+        if j < first_idx:
+            x_pred[j], P_pred[j] = None, None
+            x_filt[j], P_filt[j] = None, None
+            continue
+        # Predict
+        x_pr = F @ x_prev
+        if gravity_per_frame != 0.0:
+            x_pr[3, 0] += gravity_per_frame  # vy += g
+            x_pr[1, 0] += 0.5 * gravity_per_frame  # y += 0.5*g
+        P_pr = F @ P_prev @ F.T + Q
+        # Update (with gating if measurement present)
+        if has_meas[j]:
+            y = (z[j].reshape(4, 1) - (H @ x_pr))
+            S = H @ P_pr @ H.T + R
+            S = S + 1e-6 * np.eye(4)
+            try:
+                S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                S_inv = np.linalg.pinv(S)
+            d2 = float((y.T @ S_inv @ y).ravel()[0])
+            thr = gate_chisq_thresh
+            if gate_use_conf:
+                conf = float(confs[j]) if j < len(confs) else 1.0
+                thr = gate_chisq_thresh * (0.5 + 0.5 * max(0.0, min(1.0, conf)))
+            if d2 <= thr:
+                K = P_pr @ H.T @ S_inv
                 x_upd = x_pr + K @ y
                 P_upd = (I - K @ H) @ P_pr
             else:
                 x_upd, P_upd = x_pr, P_pr
-            x_pred[j], P_pred[j] = x_pr, P_pr
-            x_filt[j], P_filt[j] = x_upd, P_upd
-            x_prev, P_prev = x_upd, P_upd
-        elif j > first_idx:
-            x_pr = F @ x_prev
-            P_pr = F @ P_prev @ F.T + Q
-            if has_meas[j]:
-                y = (z[j].reshape(4, 1) - (H @ x_pr))
-                S = H @ P_pr @ H.T + R
-                S = S + 1e-6 * np.eye(4)
-                try:
-                    S_inv = np.linalg.inv(S)
-                except np.linalg.LinAlgError:
-                    S_inv = np.linalg.pinv(S)
-                d2 = float((y.T @ S_inv @ y).ravel()[0])
-                thr = gate_chisq_thresh
-                if gate_use_conf:
-                    conf = float(confs[j]) if j < len(confs) else 1.0
-                    thr = gate_chisq_thresh * (0.5 + 0.5 * max(0.0, min(1.0, conf)))
-                if d2 <= thr:
-                    K = P_pr @ H.T @ S_inv
-                    x_upd = x_pr + K @ y
-                    P_upd = (I - K @ H) @ P_pr
-                else:
-                    x_upd, P_upd = x_pr, P_pr
-            else:
-                x_upd, P_upd = x_pr, P_pr
-            x_pred[j], P_pred[j] = x_pr, P_pr
-            x_filt[j], P_filt[j] = x_upd, P_upd
-            x_prev, P_prev = x_upd, P_upd
         else:
-            x_pred[j], P_pred[j] = None, None
-            x_filt[j], P_filt[j] = None, None
+            x_upd, P_upd = x_pr, P_pr
+        x_pred[j], P_pred[j] = x_pr, P_pr
+        x_filt[j], P_filt[j] = x_upd, P_upd
+        x_prev, P_prev = x_upd, P_upd
 
     last_idx = max(i for i in range(M) if has_meas[i])
-    for j in range(first_idx + 1, last_idx + 1):
-        if x_pred[j] is None:
-            x_pr = F @ x_filt[j - 1]
-            P_pr = F @ P_filt[j - 1] @ F.T + Q
-            x_pred[j], P_pred[j] = x_pr, P_pr
-            x_filt[j], P_filt[j] = x_pr, P_pr
 
     x_smooth: List[np.ndarray] = [None] * M  # type: ignore
     P_smooth: List[np.ndarray] = [None] * M  # type: ignore
@@ -231,4 +216,3 @@ def kalman_rts_smooth(
                 }
 
     return out
-

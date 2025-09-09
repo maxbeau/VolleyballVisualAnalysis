@@ -20,7 +20,6 @@ def infer_ball_on_video(
     combined_jsonl: str = "outputs/ball_detections.jsonl",
     cache_only: bool = False,
 ) -> None:
-    # Lazy import to keep module load fast
     # Prepare IO
     ensure_dir(cache_dir)
     ensure_dir(os.path.dirname(combined_jsonl) or ".")
@@ -55,6 +54,15 @@ def infer_ball_on_video(
                 out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     records: List[dict] = []
+    # Optional memory-I/O toggles
+    def parse_bool(s, default=False):
+        if s is None:
+            return default
+        return str(s).strip().lower() in ("1", "true", "yes", "on", "y")
+
+    save_jpegs = parse_bool(env.get("BALL_SAVE_JPEGS", "false"), False)
+    save_frame_json = parse_bool(env.get("BALL_SAVE_FRAME_JSON", "false"), False)
+
     if cache_only:
         # Rebuild combined jsonl from existing per-frame json cache
         pattern = re.compile(r"frame_(\d{6})\.json$")
@@ -95,21 +103,24 @@ def infer_ball_on_video(
                     frame_idx += 1
                     continue
 
-                # Write a temporary JPEG to avoid SDK image-format ambiguity
-                tmp_path = os.path.join(cache_dir, f"frame_{frame_idx:06d}.jpg")
-                cv2.imwrite(tmp_path, frame)
+                # Optional JPEG caching (disabled by default)
+                if save_jpegs:
+                    tmp_path = os.path.join(cache_dir, f"frame_{frame_idx:06d}.jpg")
+                    if not os.path.exists(tmp_path):
+                        cv2.imwrite(tmp_path, frame)
 
                 # Cache JSON path per frame (idempotent)
                 json_path = os.path.join(cache_dir, f"frame_{frame_idx:06d}.json")
-                if os.path.exists(json_path):
+                if save_frame_json and os.path.exists(json_path):
                     with open(json_path, "r", encoding="utf-8") as jf:
                         result = json.load(jf)
                 else:
-                    # Inference call
-                    result = client.infer_image(tmp_path, model_id=model_id, confidence=confidence)
-                    # Persist per-frame prediction for reuse
-                    with open(json_path, "w", encoding="utf-8") as jf:
-                        json.dump(result, jf, ensure_ascii=False)
+                    # Inference call on in-memory frame to avoid disk I/O
+                    result = client.infer_frame(frame, model_id=model_id, confidence=confidence)
+                    # Persist per-frame prediction for reuse (optional)
+                    if save_frame_json:
+                        with open(json_path, "w", encoding="utf-8") as jf:
+                            json.dump(result, jf, ensure_ascii=False)
 
                 # Build compact record for tracking pipeline
                 preds = result.get("predictions", []) if isinstance(result, dict) else []
