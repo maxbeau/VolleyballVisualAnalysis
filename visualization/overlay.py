@@ -229,6 +229,7 @@ def main():
             except Exception:
                 court_corners = None
     i = 0
+    last_court_pts: Optional[List[Tuple[float, float]]] = None
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -255,8 +256,14 @@ def main():
 
         # Draw court
         pts: Optional[List[Tuple[float, float]]] = None
-        if court_timeseries is not None and i in court_timeseries:
-            pts = court_timeseries.get(i)
+        if court_timeseries is not None:
+            if i in court_timeseries:
+                pts = court_timeseries.get(i)
+                last_court_pts = pts
+            else:
+                # Hold previous court corners if current frame missing
+                if last_court_pts is not None:
+                    pts = last_court_pts
         elif court_corners is not None and len(court_corners) == 4:
             pts = court_corners
         if pts is not None and len(pts) == 4:

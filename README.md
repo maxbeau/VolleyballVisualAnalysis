@@ -95,8 +95,11 @@ python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detecti
 - `analysis/smoothing.py`：Kalman + RTS 平滑、观测门控与重力注入
 - `court/utils.py`：球场几何工具（角点解析与排序）
 - `court/detect.py`：仅采集球场检测结果（抽样帧 JPEG+原始 JSON、合并 JSONL）
-- `court/processing.py`：角点时序平滑与插值，输出逐帧 `court_tracking.jsonl`
-- `court/smoothing.py`：角点 Kalman+RTS（x,y,vx,vy）独立滤波，支持 hold 回退
+- `court/config.py`：Court 跟踪/门控/模板评分/Kalman 等参数集中管理
+- `court/tracker.py`：LK+RANSAC 单应 + 模板评分 + 几何门控 + Kalman 平滑
+- `court/io.py`：关键帧 JSONL 加载与稳健去极值
+- `court/processing.py`：编排器（读取关键帧→跟踪→写 `court_tracking.jsonl`）
+- `court/smoothing.py`：2D 常速度 Kalman（世界坐标轻量去噪，用于轨迹）
 - `core/roboflow_client.py`：Roboflow SDK 轻封装与网络设置
 - `core/utils.py`：读取 `.env`、保证目录存在、选择视频路径
 - `court/homography.py`：基于时序角点（tracking）计算单应性并生成鸟瞰图
