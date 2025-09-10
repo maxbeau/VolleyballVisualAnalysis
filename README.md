@@ -11,6 +11,8 @@
 - 重力外推：在预测步注入竖直加速度，使轨迹外推更接近抛物线
 - 软权重过滤：按长宽比对可疑框做置信度衰减，减少误检干扰
 - 叠加可视化：在原视频绘制球框与可选球场边界，输出新视频
+  - 球场方向自适应：四朝向模板打分 + EMA 平滑 + 连胜门槛 + 切换锁定
+  - 中线与三米线：按标准 18×9m 模型投影中线（x=9m）与三米线（x=6m、12m）
  
 
 ---
@@ -46,6 +48,7 @@ pip install -r requirements.txt
 - 门控与重力：`OBS_GATE_CHISQ_THRESH`，`OBS_GATE_USE_CONF`，`GRAVITY_PPS2`
 - 软权重过滤：`FILTER_MIN_ASPECT_RATIO`，`FILTER_MAX_ASPECT_RATIO`，`FILTER_AR_SOFT_ALPHA`
 - 球场叠加：`COURT_OVERLAY`，`COURT_OVERLAY_METHOD(=timeseries)`，`COURT_COLOR`，`COURT_THICKNESS`
+  - 线条颜色扩展：`COURT_CENTER_COLOR`（中线，默认 0,255,255），`COURT_ATTACK_COLOR`（三米线，默认 255,0,255）
 
 ---
 
@@ -155,6 +158,14 @@ python3 scripts/run_court_homography.py \
 - 保存单应性：`outputs/court_homography.npy`（3x3）与元数据 JSON。
 - 从原视频取一帧（默认中间帧）透视展开，得到 `outputs/court_birdseye.jpg`。
 - 如需固定像素尺寸，可用 `--model-size 1800x900` 覆盖比例参数。
+
+---
+
+## 🧩 球场方向识别与线条渲染（叠加阶段）
+
+- 四朝向模板打分：在模型平面（18×9m）生成模板（外框+中线+两条三米线），对 0/90/180/270° 四种朝向计算模板命中率（投影后命中边缘的比例），择优。
+- 平滑与滞后：首帧直接选最优；后续对分数做 EMA 平滑，仅当候选朝向相对当前朝向优势>5% 且连续≥3 帧时才切换；切换后锁定 10 帧避免来回抖动。
+- 线条渲染：使用最终朝向对应的单应性投影中线（x=9m）与三米线（x=6m、12m），并绘制外框。
 
 ---
 

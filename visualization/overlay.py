@@ -4,6 +4,8 @@ import bisect
 import cv2
 import math
 from typing import Dict, Any, List, Optional, Tuple
+import numpy as np
+from court.utils import standard_court_model_size
 from core.config import settings
 from core.utils import ensure_dir
 from analysis.smoothing import kalman_rts_smooth
@@ -114,6 +116,8 @@ def main():
     court_method = settings.COURT_OVERLAY_METHOD
     court_color = settings.COURT_COLOR
     court_thickness = settings.COURT_THICKNESS
+    court_center_color = settings.COURT_CENTER_COLOR
+    court_attack_color = settings.COURT_ATTACK_COLOR
 
     if not os.path.exists(jsonl_path):
         raise FileNotFoundError(f"JSONL not found: {jsonl_path}. Run detect_ball.py first.")
@@ -228,6 +232,34 @@ def main():
                     court_corners = [(float(x), float(y)) for x, y in cdata["median"]]
             except Exception:
                 court_corners = None
+    # Precompute canonical court model size and line template
+    Wm, Hm = standard_court_model_size(scale_px_per_meter=100.0)
+    def build_model_template(W: int, H: int, line_px: int = max(1, court_thickness)) -> np.ndarray:
+        mask = np.zeros((H, W), dtype=np.uint8)
+        # Border
+        cv2.rectangle(mask, (0, 0), (W - 1, H - 1), 255, thickness=line_px)
+        # Net (center) x = W/2
+        cx = int(round((W - 1) * 0.5))
+        cv2.line(mask, (cx, 0), (cx, H - 1), 255, thickness=line_px)
+        # Attack lines x= W*6/18 and x= W*12/18
+        a1 = int(round((W - 1) * (6.0 / 18.0)))
+        a2 = int(round((W - 1) * (12.0 / 18.0)))
+        cv2.line(mask, (a1, 0), (a1, H - 1), 255, thickness=line_px)
+        cv2.line(mask, (a2, 0), (a2, H - 1), 255, thickness=line_px)
+        return mask
+    model_tpl = build_model_template(Wm, Hm, max(1, court_thickness))
+
+    # Orientation temporal smoothing + hysteresis
+    last_rot = 0  # 0,1,2,3 => 0,90,180,270 deg
+    score_ema = np.zeros(4, dtype=np.float32)
+    ema_inited = False
+    ema_alpha = 0.3  # 0<alpha<=1; higher reacts faster
+    improve_eps = 0.05  # require >5% improvement on smoothed score to switch
+    switch_patience = 3  # need N consecutive wins to flip
+    consecutive_wins = 0
+    lock_frames = 10  # after switch, lock orientation for N frames
+    lock_left = 0
+
     i = 0
     last_court_pts: Optional[List[Tuple[float, float]]] = None
     while True:
@@ -267,12 +299,100 @@ def main():
         elif court_corners is not None and len(court_corners) == 4:
             pts = court_corners
         if pts is not None and len(pts) == 4:
-            # Order should be TL, TR, BR, BL; connect in order and close
+            # Orientation-aware model->image homography selection by template precision
+            dst = np.array([[pts[0][0], pts[0][1]], [pts[1][0], pts[1][1]], [pts[2][0], pts[2][1]], [pts[3][0], pts[3][1]]], dtype=np.float32)
+            src0 = np.array([[0.0, 0.0], [Wm - 1.0, 0.0], [Wm - 1.0, Hm - 1.0], [0.0, Hm - 1.0]], dtype=np.float32)
+            # 90/180/270 deg rotations of the model corners
+            src90 = np.array([[0.0, Hm - 1.0], [0.0, 0.0], [Wm - 1.0, 0.0], [Wm - 1.0, Hm - 1.0]], dtype=np.float32)
+            src180 = np.array([[Wm - 1.0, Hm - 1.0], [0.0, Hm - 1.0], [0.0, 0.0], [Wm - 1.0, 0.0]], dtype=np.float32)
+            src270 = np.array([[Wm - 1.0, 0.0], [Wm - 1.0, Hm - 1.0], [0.0, Hm - 1.0], [0.0, 0.0]], dtype=np.float32)
+
+            gr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gr, 50, 150)
+            edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+            def score_for(src: np.ndarray) -> Tuple[float, np.ndarray]:
+                Hmi = cv2.getPerspectiveTransform(src, dst)
+                warped = cv2.warpPerspective(model_tpl, Hmi, (frame.shape[1], frame.shape[0]), flags=cv2.INTER_NEAREST)
+                tmask = warped > 0
+                if not np.any(tmask):
+                    return 0.0, Hmi
+                overlap = (edges > 0) & tmask
+                prec = float(overlap.sum()) / float(tmask.sum())
+                return prec, Hmi
+
+            candidates = [src0, src90, src180, src270]
+            cand_scores: List[Tuple[float, int, np.ndarray]] = []
+            for k, s in enumerate(candidates):
+                sc, Hmi = score_for(s)
+                cand_scores.append((sc, k, Hmi))
+            # Update EMA of scores per orientation
+            raw_scores = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            Hcands = {}
+            for sc, k, Hmi in cand_scores:
+                raw_scores[k] = float(sc)
+                Hcands[k] = Hmi
+            if not ema_inited:
+                # First frame: directly choose the best orientation (no hysteresis)
+                score_ema = raw_scores.copy()
+                ema_inited = True
+                last_rot = int(np.argmax(score_ema))
+                rot = last_rot
+                H = Hcands[rot]
+                consecutive_wins = 0
+                lock_left = 0
+            else:
+                # Smooth scores over time
+                score_ema = (1.0 - ema_alpha) * score_ema + ema_alpha * raw_scores
+                best_rot = int(np.argmax(score_ema))
+
+                # Orientation locking to prevent rapid flips
+                if lock_left > 0:
+                    rot = last_rot
+                    H = Hcands.get(rot, Hcands.get(best_rot))
+                    lock_left -= 1
+                else:
+                    # Check if best rot truly better than current with margin
+                    curr = float(score_ema[last_rot])
+                    cand = float(score_ema[best_rot])
+                    if best_rot != last_rot and cand > curr * (1.0 + improve_eps):
+                        consecutive_wins += 1
+                        if consecutive_wins >= switch_patience:
+                            rot = best_rot
+                            H = Hcands[rot]
+                            last_rot = rot
+                            consecutive_wins = 0
+                            lock_left = lock_frames
+                        else:
+                            rot = last_rot
+                            H = Hcands[rot]
+                    else:
+                        consecutive_wins = 0
+                        rot = last_rot
+                        H = Hcands[rot]
+
+            # Draw outer border
             pairs = [(0, 1), (1, 2), (2, 3), (3, 0)]
             for a, b in pairs:
                 ax, ay = int(round(pts[a][0])), int(round(pts[a][1]))
                 bx, by = int(round(pts[b][0])), int(round(pts[b][1]))
                 cv2.line(frame, (ax, ay), (bx, by), court_color, court_thickness)
+
+            # Render center/attack lines using chosen H (model->image)
+            def proj_vline(x_model: float) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+                P = np.array([[x_model, 0.0], [x_model, Hm - 1.0]], dtype=np.float32).reshape(-1, 1, 2)
+                Q = cv2.perspectiveTransform(P, H).reshape(-1, 2)
+                return (int(round(Q[0, 0])), int(round(Q[0, 1]))), (int(round(Q[1, 0])), int(round(Q[1, 1])))
+
+            x_center = (Wm - 1.0) * 0.5
+            c0, c1 = proj_vline(x_center)
+            cv2.line(frame, c0, c1, court_center_color, max(1, court_thickness))
+            x_a1 = (Wm - 1.0) * (6.0 / 18.0)
+            x_a2 = (Wm - 1.0) * (12.0 / 18.0)
+            a10, a11 = proj_vline(x_a1)
+            a20, a21 = proj_vline(x_a2)
+            cv2.line(frame, a10, a11, court_attack_color, max(1, court_thickness))
+            cv2.line(frame, a20, a21, court_attack_color, max(1, court_thickness))
 
         if resize_needed:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)

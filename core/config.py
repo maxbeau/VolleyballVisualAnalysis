@@ -53,6 +53,9 @@ class Settings:
         self.COURT_OVERLAY_METHOD: str = os.getenv("COURT_OVERLAY_METHOD", "timeseries")
         self.COURT_COLOR: tuple = tuple(map(int, os.getenv("COURT_COLOR", "0,255,0").split(',')))
         self.COURT_THICKNESS: int = int(os.getenv("COURT_THICKNESS", "2"))
+        # Extra court lines (center and 3m attack lines)
+        self.COURT_CENTER_COLOR: tuple = tuple(map(int, os.getenv("COURT_CENTER_COLOR", "0,255,255").split(',')))
+        self.COURT_ATTACK_COLOR: tuple = tuple(map(int, os.getenv("COURT_ATTACK_COLOR", "255,0,255").split(',')))
 
     def _pick_video_path(self) -> str:
         """Finds the video file to process."""
