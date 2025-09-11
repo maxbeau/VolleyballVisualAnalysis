@@ -13,6 +13,16 @@
 - 叠加可视化：在原视频绘制球框与可选球场边界，输出新视频
   - 球场方向自适应：四朝向模板打分 + EMA 平滑 + 连胜门槛 + 切换锁定
   - 中线与三米线：按标准 18×9m 模型投影中线（x=9m）与三米线（x=6m、12m）
+
+### Ball 轨迹构建（新版推荐：Viterbi 全局路径）
+- 全局最优路径（Viterbi/DP）：逐帧必选（候选或 Null），节点代价（置信度/圆度/边缘）+ 边代价（位移/尺寸变化/方向/加速度），避免“静态灯短暂接管”，更稳地跨越遮挡和切换。
+- 关键开关与权重（.env）：
+  - `USE_VITERBI_SELECTION=true`，`VIT_TOPK=5`
+  - 节点：`VIT_W_CONF`，`VIT_W_AR`，`VIT_W_CIRCLE`，`VIT_W_BORDER`，`IMAGE_BORDER_MARGIN_PX`
+  - 边：`VIT_W_DIST`，`VIT_W_SIZE`，`VIT_W_DIR`，`VIT_W_ACCEL`，`VIT_DIR_MAX_DEG`
+  - 空段/重启：`VIT_GAP_PENALTY`，`VIT_START_PENALTY`
+  - 跳变门控：`CONT_MAX_JUMP_PX`
+- 运动学硬门控（可选）：默认关闭，仅保留 Viterbi 的“软约束”；若需要再启用 `KIN_STATIC_FILTER_ENABLE` 等。
  
 
 ---
@@ -115,7 +125,8 @@ python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detecti
 
 ## 📁 关键文件
 - `ball/detect.py`：Roboflow 抽帧检测、缓存与 JSONL 汇总
-- `visualization/overlay.py`：叠加渲染（Kalman+RTS、软权重、重力、可选场地）
+- `ball/pipeline.py`：Ball 轨迹管线（加载候选 → Viterbi 全局路径 → 可选连续性贪心/确认/回溯）
+- `visualization/overlay.py`：叠加渲染（Viterbi 轨迹、Kalman 可选、软权重、可选场地）
 - `analysis/smoothing.py`：Kalman + RTS 平滑、观测门控与重力注入
 - `court/utils.py`：球场几何工具（角点解析与排序）
 - `court/detect.py`：仅采集球场检测结果（抽样帧 JPEG+原始 JSON、合并 JSONL）
@@ -153,7 +164,10 @@ python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detecti
 ## 🚀 调参与建议
 - 重力：`GRAVITY_PPS2 ≈ 9.8 * px_per_m`；未知比率可先试 150–250
 - 长宽比：先宽后紧，区间外用 `FILTER_AR_SOFT_ALPHA` 控制衰减强度
-- 门控：`OBS_GATE_CHISQ_THRESH≈18.4`（4 维观测约 3σ），低置信度时更严格
+- Viterbi 建议：
+  - 偏保留：降低 `VIT_W_DIST/size` 与 `VIT_GAP_PENALTY`，升高 `VIT_W_CONF`；
+  - 偏严格：升高 `VIT_W_DIST/size/dir/accel` 与 `VIT_GAP_PENALTY`；
+  - 误判多在边缘：适度提高 `VIT_W_BORDER` 或增大 `IMAGE_BORDER_MARGIN_PX`。
 - 插值：`MAX_INTERP_GAP_FRAMES` 控制遮挡段插值长度，过大可能漂移
 
 如需更多定制（ROI 过滤、单应透视、标准场地坐标系等），可在此基础上扩展。

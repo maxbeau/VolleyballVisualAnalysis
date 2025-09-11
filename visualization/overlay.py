@@ -11,6 +11,7 @@ from core.utils import ensure_dir
 from analysis.smoothing import kalman_rts_smooth
 from analysis.kinematic_filter import filter_by_kinematics
 from ball.pipeline import build_ball_tracks, parse_frame_spec
+from ball.pipeline import build_ball_tracks, parse_frame_spec
 
 
 def to_tlbr_from_xywh(x: float, y: float, w: float, h: float) -> Tuple[int, int, int, int]:
@@ -37,208 +38,7 @@ def parse_color(s: str, default=(0, 255, 0)) -> Tuple[int, int, int]:
     return default
 
 
-def load_best_ball_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dict[int, Dict[str, Any]]:
-    best: Dict[int, Dict[str, Any]] = {}
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            frame_idx = int(rec.get("frame", -1))
-            if frame_idx < 0:
-                continue
-            preds = rec.get("predictions", []) or []
-            # choose highest confidence of allowed classes
-            cand = None
-            for p in preds:
-                cls = p.get("class")
-                if cls not in allowed_classes:
-                    continue
-                if cand is None or float(p.get("confidence", 0.0)) > float(cand.get("confidence", 0.0)):
-                    cand = p
-            if cand is not None:
-                best[frame_idx] = cand
-    return best
-
-
-def load_all_ball_preds_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dict[int, List[Dict[str, Any]]]:
-    by_frame: Dict[int, List[Dict[str, Any]]] = {}
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            frame_idx = int(rec.get("frame", -1))
-            if frame_idx < 0:
-                continue
-            preds = rec.get("predictions", []) or []
-            cands: List[Dict[str, Any]] = []
-            for p in preds:
-                cls = p.get("class")
-                if cls in allowed_classes:
-                    cands.append(p)
-            if cands:
-                by_frame[frame_idx] = cands
-    return by_frame
-
-
-def select_by_continuity(
-    preds_by_frame: Dict[int, List[Dict[str, Any]]],
-    max_jump_px: float,
-    topk: int,
-    reseed_misses: int = 3,
-) -> Dict[int, Dict[str, Any]]:
-    frames = sorted(preds_by_frame.keys())
-    if not frames:
-        return {}
-    best: Dict[int, Dict[str, Any]] = {}
-    # Seed with highest-confidence candidate in first frame
-    f0 = frames[0]
-    cands0 = sorted(preds_by_frame[f0], key=lambda p: float(p.get("confidence", 0.0)), reverse=True)
-    seed0 = cands0[0].copy()
-    seed0.setdefault("_reseed", True)
-    best[f0] = seed0
-    last_x = float(best[f0].get("x", 0.0))
-    last_y = float(best[f0].get("y", 0.0))
-    misses = 0
-    for f in frames[1:]:
-        cands = preds_by_frame[f]
-        # Consider top-k by confidence, then pick one with minimal distance to last
-        cands_sorted = sorted(cands, key=lambda p: float(p.get("confidence", 0.0)), reverse=True)
-        subset = cands_sorted[: max(1, topk)]
-        chosen = None
-        best_d = 1e9
-        for p in subset:
-            dx = float(p.get("x", 0.0)) - last_x
-            dy = float(p.get("y", 0.0)) - last_y
-            d = (dx * dx + dy * dy) ** 0.5
-            if d < best_d:
-                best_d = d
-                chosen = p
-        # Gate by max jump; if too far, skip this frame (no update)
-        if chosen is not None and best_d <= max_jump_px:
-            best[f] = chosen
-            last_x = float(chosen.get("x", 0.0))
-            last_y = float(chosen.get("y", 0.0))
-            misses = 0
-        # else leave gap (no best for this frame)
-        else:
-            misses += 1
-            if reseed_misses > 0 and misses >= reseed_misses:
-                # Reseed with top-1 to recover track after long gap/occlusion
-                seed = cands_sorted[0].copy()
-                seed.setdefault("_reseed", True)
-                best[f] = seed
-                last_x = float(seed.get("x", 0.0))
-                last_y = float(seed.get("y", 0.0))
-                misses = 0
-    return best
-
-
-def retro_prune_segments(best: Dict[int, Dict[str, Any]], min_len: int, min_move_px: float, adjacency_gap_max: int = 3) -> Dict[int, Dict[str, Any]]:
-    """Backward pruning: drop short/static segments that are likely false starts.
-    Segment is consecutive frames in `best` (gap==1). If a segment length < min_len
-    or total displacement < min_move_px, remove it.
-    """
-    if not best:
-        return best
-    frames = sorted(best.keys())
-    keep = set(frames)
-    seg = [frames[0]]
-    for a, b in zip(frames, frames[1:]):
-        if (b - a) <= max(1, adjacency_gap_max):
-            seg.append(b)
-        else:
-            # close segment
-            if len(seg) > 0:
-                if len(seg) < max(1, min_len):
-                    for f in seg:
-                        keep.discard(f)
-                else:
-                    # compute total path length only if segment has >=2 points
-                    if len(seg) >= 2:
-                        dist = 0.0
-                        for u, v in zip(seg, seg[1:]):
-                            p0 = best[u]; p1 = best[v]
-                            dx = float(p1.get("x", 0.0)) - float(p0.get("x", 0.0))
-                            dy = float(p1.get("y", 0.0)) - float(p0.get("y", 0.0))
-                            dist += (dx*dx + dy*dy) ** 0.5
-                        if dist < max(0.0, min_move_px):
-                            for f in seg:
-                                keep.discard(f)
-            seg = [b]
-    # tail segment
-    if len(seg) > 0:
-        if len(seg) < max(1, min_len):
-            for f in seg:
-                keep.discard(f)
-        else:
-            if len(seg) >= 2:
-                dist = 0.0
-                for u, v in zip(seg, seg[1:]):
-                    p0 = best[u]; p1 = best[v]
-                    dx = float(p1.get("x", 0.0)) - float(p0.get("x", 0.0))
-                    dy = float(p1.get("y", 0.0)) - float(p0.get("y", 0.0))
-                    dist += (dx*dx + dy*dy) ** 0.5
-                if dist < max(0.0, min_move_px):
-                    for f in seg:
-                        keep.discard(f)
-    return {k: v for k, v in best.items() if k in keep}
-
-
-def _ar_dev(p: Dict[str, Any]) -> float:
-    try:
-        w = float(p.get("width", 0.0)); h = float(p.get("height", 0.0))
-        return abs((w / max(h, 1e-6)) - 1.0)
-    except Exception:
-        return 999.0
-
-
-def confirm_reseeds(best: Dict[int, Dict[str, Any]], lookahead: int, min_move_px: float, min_conf: float, max_ar_dev: float) -> Tuple[Dict[int, Dict[str, Any]], List[int], List[Tuple[int,int]]]:
-    """Confirm or replace reseeds using short lookahead.
-    - If no follow-up within lookahead moves >= min_move_px: drop reseed.
-    - If a follow-up exists and is more ball-like (conf>=min_conf or |ar-1|<=max_ar_dev), replace reseed by the follow-up (drop reseed f, keep g).
-    Returns: (pruned_best, removed_reseeds, replaced_pairs[f->g]).
-    """
-    if not best or lookahead <= 0:
-        return best, [], []
-    frames = sorted(best.keys())
-    keep = set(frames)
-    removed: List[int] = []
-    replaced: List[Tuple[int,int]] = []
-    for f in frames:
-        if f not in best:
-            continue
-        p = best[f]
-        if not isinstance(p, dict) or not p.get("_reseed"):
-            continue
-        # search in next [1..lookahead] kept frames
-        chosen_g = None
-        for g in range(f + 1, f + lookahead + 1):
-            if g in best:
-                q = best[g]
-                dx = float(q.get("x", 0.0)) - float(p.get("x", 0.0))
-                dy = float(q.get("y", 0.0)) - float(p.get("y", 0.0))
-                d = (dx * dx + dy * dy) ** 0.5
-                if d >= max(0.0, min_move_px):
-                    # check ball-like
-                    conf_g = float(q.get("confidence", 0.0))
-                    if (conf_g >= min_conf) or (_ar_dev(q) <= max_ar_dev):
-                        chosen_g = g
-                        break
-        if chosen_g is None:
-            # confirmation failed -> drop reseed f
-            keep.discard(f)
-            removed.append(f)
-        else:
-            # replace: drop reseed f, keep chosen_g
-            keep.discard(f)
-            removed.append(f)
-            replaced.append((f, chosen_g))
-    pruned = {k: v for k, v in best.items() if k in keep}
-    return pruned, removed, replaced
+    # legacy helpers removed; using ball.pipeline instead
 
 
 def pred_with_kalman_or_hold(
@@ -344,6 +144,7 @@ def main():
             allowed_classes=allowed,
             fps=fps,
             settings=settings,
+            img_wh=(width, height),
         )
         confirm_pruned_frames = dbg0.get("confirm_pruned", set())
         retro_pruned_frames = dbg0.get("retro_pruned", set())

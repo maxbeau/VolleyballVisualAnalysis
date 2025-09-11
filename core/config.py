@@ -109,6 +109,26 @@ class Settings:
         self.CONFIRM_MIN_CONF: float = float(os.getenv("CONFIRM_MIN_CONF", "0.6"))
         self.CONFIRM_MAX_AR_DEV: float = float(os.getenv("CONFIRM_MAX_AR_DEV", "0.5"))  # |w/h - 1|
 
+        # Viterbi/DP global path selection
+        self.USE_VITERBI_SELECTION: bool = os.getenv("USE_VITERBI_SELECTION", "false").lower() == "true"
+        self.VIT_TOPK: int = int(os.getenv("VIT_TOPK", "5"))
+        self.VIT_MAX_GAP_FRAMES: int = int(os.getenv("VIT_MAX_GAP_FRAMES", "3"))
+        self.VIT_GAP_PENALTY: float = float(os.getenv("VIT_GAP_PENALTY", "1.0"))
+        # Node costs
+        self.VIT_W_CONF: float = float(os.getenv("VIT_W_CONF", "1.0"))
+        self.VIT_W_AR: float = float(os.getenv("VIT_W_AR", "0.2"))
+        self.VIT_W_CIRCLE: float = float(os.getenv("VIT_W_CIRCLE", "0.0"))  # use (1 - q)
+        self.VIT_W_BORDER: float = float(os.getenv("VIT_W_BORDER", "0.0"))  # near-frame-edge penalty
+        self.IMAGE_BORDER_MARGIN_PX: float = float(os.getenv("IMAGE_BORDER_MARGIN_PX", "24"))
+        # Edge costs
+        self.VIT_W_DIST: float = float(os.getenv("VIT_W_DIST", "0.1"))
+        self.VIT_W_SIZE: float = float(os.getenv("VIT_W_SIZE", "0.1"))
+        self.VIT_W_DIR: float = float(os.getenv("VIT_W_DIR", "0.0"))
+        self.VIT_W_ACCEL: float = float(os.getenv("VIT_W_ACCEL", "0.0"))
+        self.VIT_DIR_MAX_DEG: float = float(os.getenv("VIT_DIR_MAX_DEG", "180"))
+        # Start penalty (starting later should not dominate)
+        self.VIT_START_PENALTY: float = float(os.getenv("VIT_START_PENALTY", "0.5"))
+
         # Evaluation-only known non-ball frames (comma/range string). Not used for filtering.
         self.EVAL_NONBALL_FRAMES: str = os.getenv("EVAL_NONBALL_FRAMES", "")
 

@@ -135,6 +135,200 @@ def select_by_continuity(
 
 
 # ------------------------
+# Viterbi/DP global path (optional)
+# ------------------------
+
+def _node_cost(p: Dict[str, Any], settings, img_wh: Optional[Tuple[int, int]] = None) -> float:
+    conf = max(1e-6, min(1.0, float(p.get("confidence", 0.0))))
+    w = float(p.get("width", 0.0)); h = float(p.get("height", 0.0))
+    ar_dev = abs((w / max(h, 1e-6)) - 1.0) if (w > 0 and h > 0) else 1.0
+    cost = settings.VIT_W_CONF * (-math.log(conf)) + settings.VIT_W_AR * ar_dev
+    # Circle quality (if available): penalize low q
+    try:
+        q = float(p.get("circle", {}).get("q", None))
+        if q is not None:
+            cost += settings.VIT_W_CIRCLE * (1.0 - max(0.0, min(1.0, q)))
+    except Exception:
+        pass
+    # Border proximity penalty (optional)
+    if img_wh is not None and settings.VIT_W_BORDER > 0.0:
+        try:
+            iw, ih = int(img_wh[0]), int(img_wh[1])
+            # prefer circle center if present
+            circ = p.get("circle", {}) if isinstance(p.get("circle"), dict) else {}
+            cx = float(circ.get("u", p.get("x", 0.0)))
+            cy = float(circ.get("v", p.get("y", 0.0)))
+            d_edge = min(cx, iw - cx, cy, ih - cy)
+            margin = max(1.0, float(settings.IMAGE_BORDER_MARGIN_PX))
+            if d_edge < margin:
+                t = (margin - d_edge) / margin
+                cost += settings.VIT_W_BORDER * t
+        except Exception:
+            pass
+    return cost
+
+
+def _edge_cost(pa: Dict[str, Any], pb: Dict[str, Any], dt_frames: int, settings) -> float:
+    dx = float(pb.get("x", 0.0)) - float(pa.get("x", 0.0))
+    dy = float(pb.get("y", 0.0)) - float(pa.get("y", 0.0))
+    dist = (dx * dx + dy * dy) ** 0.5
+    sigma = max(1.0, settings.CONT_MAX_JUMP_PX * max(1, dt_frames))
+    c_dist = settings.VIT_W_DIST * (dist / sigma) ** 2
+    wa = max(1e-6, float(pa.get("width", 1.0))); ha = max(1e-6, float(pa.get("height", 1.0)))
+    wb = max(1e-6, float(pb.get("width", 1.0))); hb = max(1e-6, float(pb.get("height", 1.0)))
+    c_size = settings.VIT_W_SIZE * (abs(math.log(wb/wa)) + abs(math.log(hb/ha)))
+    return c_dist + c_size
+
+
+def _dir_accel_cost(pp: Dict[str, Any], pa: Dict[str, Any], pb: Dict[str, Any], settings) -> float:
+    """Second-order kinematic penalty using direction change and acceleration.
+    pp -> pa -> pb, dt assumed = 1 frame.
+    """
+    if settings.VIT_W_DIR == 0.0 and settings.VIT_W_ACCEL == 0.0:
+        return 0.0
+    try:
+        xpp, ypp = float(pp.get("x", 0.0)), float(pp.get("y", 0.0))
+        xpa, ypa = float(pa.get("x", 0.0)), float(pa.get("y", 0.0))
+        xpb, ypb = float(pb.get("x", 0.0)), float(pb.get("y", 0.0))
+        v1x, v1y = (xpa - xpp), (ypa - ypp)
+        v2x, v2y = (xpb - xpa), (ypb - ypa)
+        # Direction change penalty (1 - cos theta)^2
+        n1 = max(1e-6, (v1x*v1x + v1y*v1y) ** 0.5)
+        n2 = max(1e-6, (v2x*v2x + v2y*v2y) ** 0.5)
+        cos_th = (v1x*v2x + v1y*v2y) / (n1 * n2)
+        cos_th = max(-1.0, min(1.0, cos_th))
+        # Optional hard gate on direction change
+        try:
+            import math as _m
+            ang_deg = _m.degrees(_m.acos(cos_th))
+            if ang_deg > max(0.0, float(settings.VIT_DIR_MAX_DEG)):
+                return float('inf')
+        except Exception:
+            pass
+        dir_pen = (1.0 - cos_th)
+        dir_cost = settings.VIT_W_DIR * (dir_pen * dir_pen)
+        # Acceleration penalty: |v2 - v1| normalized by CONT_MAX_JUMP_PX
+        ax = v2x - v1x; ay = v2y - v1y
+        a = (ax*ax + ay*ay) ** 0.5
+        sigma_v = max(1.0, float(settings.CONT_MAX_JUMP_PX))
+        acc_cost = settings.VIT_W_ACCEL * (a / sigma_v) ** 2
+        return dir_cost + acc_cost
+    except Exception:
+        return 0.0
+
+
+def select_by_viterbi(
+    preds_by_frame: Dict[int, List[Dict[str, Any]]],
+    fps: float,
+    settings,
+    img_wh: Optional[Tuple[int, int]] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Viterbi with per-frame Null state to enforce a full-length path.
+    - States per frame: K candidates + 1 Null.
+    - Node cost: candidate=_node_cost, null=GapPenalty.
+    - Edge cost: candidate→candidate uses _edge_cost; null→candidate adds StartPenalty;
+                 any→null has no edge cost (pay null node cost already).
+    """
+    frames = sorted(preds_by_frame.keys())
+    if not frames:
+        return {}
+
+    # Prepare per-frame top-K candidates
+    tops: Dict[int, List[Dict[str, Any]]] = {}
+    for f in frames:
+        cands = sorted(preds_by_frame[f], key=lambda p: float(p.get("confidence", 0.0)), reverse=True)
+        tops[f] = cands[: max(1, settings.VIT_TOPK)]
+
+    # DP: for each frame f, we store states 0..K (K=index for Null)
+    dp_cost: Dict[int, List[float]] = {}
+    dp_prev: Dict[int, List[Tuple[Optional[int], Optional[int]]]] = {}
+
+    def state_count(f: int) -> int:
+        return len(tops[f]) + 1  # +1 for Null
+
+    # Initialize at first frame
+    f0 = frames[0]
+    K0 = state_count(f0)
+    dp_cost[f0] = [float('inf')] * K0
+    dp_prev[f0] = [(None, None)] * K0
+    # candidate states
+    for i, p in enumerate(tops[f0]):
+        dp_cost[f0][i] = _node_cost(p, settings, img_wh) + settings.VIT_START_PENALTY
+    # null state
+    dp_cost[f0][K0 - 1] = settings.VIT_GAP_PENALTY  # null node cost
+
+    # Transition frame by frame
+    for t in range(1, len(frames)):
+        f = frames[t]
+        pf = frames[t - 1]
+        K = state_count(f)
+        Kp = state_count(pf)
+        dp_cost[f] = [float('inf')] * K
+        dp_prev[f] = [(None, None)] * K
+
+        # For each current state
+        for i in range(K):
+            # Current state cost (node)
+            if i < len(tops[f]):
+                node_c = _node_cost(tops[f][i], settings, img_wh)
+            else:
+                node_c = settings.VIT_GAP_PENALTY
+
+            # Try all previous states
+            for j in range(Kp):
+                prev_c = dp_cost[pf][j]
+                if prev_c == float('inf'):
+                    continue
+
+                # Edge cost
+                edge_c = 0.0
+                if j < len(tops[pf]) and i < len(tops[f]):
+                    # candidate -> candidate, apply gate
+                    pa = tops[pf][j]; pb = tops[f][i]
+                    dx = float(pb.get("x", 0.0)) - float(pa.get("x", 0.0))
+                    dy = float(pb.get("y", 0.0)) - float(pa.get("y", 0.0))
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if dist > settings.CONT_MAX_JUMP_PX * 1.5:
+                        continue
+                    edge_c = _edge_cost(pa, pb, 1, settings)
+                    # Add second-order kinematic term if previous of (pf,j) exists and is candidate
+                    ppf, ppj = dp_prev[pf][j]
+                    if ppf is not None and ppj is not None and ppj < len(tops[ppf]):
+                        pp = tops[ppf][ppj]
+                        dk = _dir_accel_cost(pp, pa, pb, settings)
+                        if dk == float('inf'):
+                            continue
+                        edge_c += dk
+                elif j == len(tops[pf]) and i < len(tops[f]):
+                    # null -> candidate: start penalty
+                    edge_c = settings.VIT_START_PENALTY
+                else:
+                    # candidate/null -> null : no extra edge cost
+                    edge_c = 0.0
+
+                cand = prev_c + edge_c + node_c
+                if cand < dp_cost[f][i]:
+                    dp_cost[f][i] = cand
+                    dp_prev[f][i] = (pf, j)
+
+    # Backtrack best terminal state at last frame
+    fend = frames[-1]
+    best_i = min(range(state_count(fend)), key=lambda i: dp_cost[fend][i])
+    path_states: Dict[int, int] = {}
+    f = fend; i = best_i
+    while f is not None and i is not None:
+        path_states[f] = i
+        pf, pj = dp_prev[f][i]
+        f, i = pf, pj
+
+    # Map back to candidate dictionary (skip null states)
+    path: Dict[int, Dict[str, Any]] = {}
+    for f, i in path_states.items():
+        if i < len(tops[f]):
+            path[f] = tops[f][i]
+    return path
+# ------------------------
 # Post-checks (backward / confirm)
 # ------------------------
 
@@ -235,6 +429,7 @@ def build_ball_tracks(
     allowed_classes: List[str],
     fps: float,
     settings,
+    img_wh: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
     """Builds ball tracks with forward continuity selection, reseed confirmation,
     retro prune, and kinematic filtering integration points.
@@ -242,7 +437,13 @@ def build_ball_tracks(
     Returns (best_tracks, debug_info).
     """
     # Load detections
-    if settings.USE_CONTINUITY_SELECTION:
+    if getattr(settings, 'USE_VITERBI_SELECTION', False):
+        preds_by_frame = load_all_ball_preds_per_frame(jsonl_path, allowed_classes)
+        best = select_by_viterbi(preds_by_frame, fps, settings, img_wh=img_wh)
+        retro_pruned_frames = set()
+        confirm_pruned_frames = set()
+        confirm_replaced_targets = set()
+    elif settings.USE_CONTINUITY_SELECTION:
         preds_by_frame = load_all_ball_preds_per_frame(jsonl_path, allowed_classes)
         best = select_by_continuity(
             preds_by_frame,
@@ -289,4 +490,3 @@ __all__ = [
     "confirm_reseeds",
     "build_ball_tracks",
 ]
-
