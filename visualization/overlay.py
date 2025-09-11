@@ -9,6 +9,8 @@ from court.utils import standard_court_model_size, build_court_model_template, t
 from core.config import settings
 from core.utils import ensure_dir
 from analysis.smoothing import kalman_rts_smooth
+from analysis.kinematic_filter import filter_by_kinematics
+from ball.pipeline import build_ball_tracks, parse_frame_spec
 
 
 def to_tlbr_from_xywh(x: float, y: float, w: float, h: float) -> Tuple[int, int, int, int]:
@@ -58,6 +60,185 @@ def load_best_ball_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dic
             if cand is not None:
                 best[frame_idx] = cand
     return best
+
+
+def load_all_ball_preds_per_frame(jsonl_path: str, allowed_classes: List[str]) -> Dict[int, List[Dict[str, Any]]]:
+    by_frame: Dict[int, List[Dict[str, Any]]] = {}
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            frame_idx = int(rec.get("frame", -1))
+            if frame_idx < 0:
+                continue
+            preds = rec.get("predictions", []) or []
+            cands: List[Dict[str, Any]] = []
+            for p in preds:
+                cls = p.get("class")
+                if cls in allowed_classes:
+                    cands.append(p)
+            if cands:
+                by_frame[frame_idx] = cands
+    return by_frame
+
+
+def select_by_continuity(
+    preds_by_frame: Dict[int, List[Dict[str, Any]]],
+    max_jump_px: float,
+    topk: int,
+    reseed_misses: int = 3,
+) -> Dict[int, Dict[str, Any]]:
+    frames = sorted(preds_by_frame.keys())
+    if not frames:
+        return {}
+    best: Dict[int, Dict[str, Any]] = {}
+    # Seed with highest-confidence candidate in first frame
+    f0 = frames[0]
+    cands0 = sorted(preds_by_frame[f0], key=lambda p: float(p.get("confidence", 0.0)), reverse=True)
+    seed0 = cands0[0].copy()
+    seed0.setdefault("_reseed", True)
+    best[f0] = seed0
+    last_x = float(best[f0].get("x", 0.0))
+    last_y = float(best[f0].get("y", 0.0))
+    misses = 0
+    for f in frames[1:]:
+        cands = preds_by_frame[f]
+        # Consider top-k by confidence, then pick one with minimal distance to last
+        cands_sorted = sorted(cands, key=lambda p: float(p.get("confidence", 0.0)), reverse=True)
+        subset = cands_sorted[: max(1, topk)]
+        chosen = None
+        best_d = 1e9
+        for p in subset:
+            dx = float(p.get("x", 0.0)) - last_x
+            dy = float(p.get("y", 0.0)) - last_y
+            d = (dx * dx + dy * dy) ** 0.5
+            if d < best_d:
+                best_d = d
+                chosen = p
+        # Gate by max jump; if too far, skip this frame (no update)
+        if chosen is not None and best_d <= max_jump_px:
+            best[f] = chosen
+            last_x = float(chosen.get("x", 0.0))
+            last_y = float(chosen.get("y", 0.0))
+            misses = 0
+        # else leave gap (no best for this frame)
+        else:
+            misses += 1
+            if reseed_misses > 0 and misses >= reseed_misses:
+                # Reseed with top-1 to recover track after long gap/occlusion
+                seed = cands_sorted[0].copy()
+                seed.setdefault("_reseed", True)
+                best[f] = seed
+                last_x = float(seed.get("x", 0.0))
+                last_y = float(seed.get("y", 0.0))
+                misses = 0
+    return best
+
+
+def retro_prune_segments(best: Dict[int, Dict[str, Any]], min_len: int, min_move_px: float, adjacency_gap_max: int = 3) -> Dict[int, Dict[str, Any]]:
+    """Backward pruning: drop short/static segments that are likely false starts.
+    Segment is consecutive frames in `best` (gap==1). If a segment length < min_len
+    or total displacement < min_move_px, remove it.
+    """
+    if not best:
+        return best
+    frames = sorted(best.keys())
+    keep = set(frames)
+    seg = [frames[0]]
+    for a, b in zip(frames, frames[1:]):
+        if (b - a) <= max(1, adjacency_gap_max):
+            seg.append(b)
+        else:
+            # close segment
+            if len(seg) > 0:
+                if len(seg) < max(1, min_len):
+                    for f in seg:
+                        keep.discard(f)
+                else:
+                    # compute total path length only if segment has >=2 points
+                    if len(seg) >= 2:
+                        dist = 0.0
+                        for u, v in zip(seg, seg[1:]):
+                            p0 = best[u]; p1 = best[v]
+                            dx = float(p1.get("x", 0.0)) - float(p0.get("x", 0.0))
+                            dy = float(p1.get("y", 0.0)) - float(p0.get("y", 0.0))
+                            dist += (dx*dx + dy*dy) ** 0.5
+                        if dist < max(0.0, min_move_px):
+                            for f in seg:
+                                keep.discard(f)
+            seg = [b]
+    # tail segment
+    if len(seg) > 0:
+        if len(seg) < max(1, min_len):
+            for f in seg:
+                keep.discard(f)
+        else:
+            if len(seg) >= 2:
+                dist = 0.0
+                for u, v in zip(seg, seg[1:]):
+                    p0 = best[u]; p1 = best[v]
+                    dx = float(p1.get("x", 0.0)) - float(p0.get("x", 0.0))
+                    dy = float(p1.get("y", 0.0)) - float(p0.get("y", 0.0))
+                    dist += (dx*dx + dy*dy) ** 0.5
+                if dist < max(0.0, min_move_px):
+                    for f in seg:
+                        keep.discard(f)
+    return {k: v for k, v in best.items() if k in keep}
+
+
+def _ar_dev(p: Dict[str, Any]) -> float:
+    try:
+        w = float(p.get("width", 0.0)); h = float(p.get("height", 0.0))
+        return abs((w / max(h, 1e-6)) - 1.0)
+    except Exception:
+        return 999.0
+
+
+def confirm_reseeds(best: Dict[int, Dict[str, Any]], lookahead: int, min_move_px: float, min_conf: float, max_ar_dev: float) -> Tuple[Dict[int, Dict[str, Any]], List[int], List[Tuple[int,int]]]:
+    """Confirm or replace reseeds using short lookahead.
+    - If no follow-up within lookahead moves >= min_move_px: drop reseed.
+    - If a follow-up exists and is more ball-like (conf>=min_conf or |ar-1|<=max_ar_dev), replace reseed by the follow-up (drop reseed f, keep g).
+    Returns: (pruned_best, removed_reseeds, replaced_pairs[f->g]).
+    """
+    if not best or lookahead <= 0:
+        return best, [], []
+    frames = sorted(best.keys())
+    keep = set(frames)
+    removed: List[int] = []
+    replaced: List[Tuple[int,int]] = []
+    for f in frames:
+        if f not in best:
+            continue
+        p = best[f]
+        if not isinstance(p, dict) or not p.get("_reseed"):
+            continue
+        # search in next [1..lookahead] kept frames
+        chosen_g = None
+        for g in range(f + 1, f + lookahead + 1):
+            if g in best:
+                q = best[g]
+                dx = float(q.get("x", 0.0)) - float(p.get("x", 0.0))
+                dy = float(q.get("y", 0.0)) - float(p.get("y", 0.0))
+                d = (dx * dx + dy * dy) ** 0.5
+                if d >= max(0.0, min_move_px):
+                    # check ball-like
+                    conf_g = float(q.get("confidence", 0.0))
+                    if (conf_g >= min_conf) or (_ar_dev(q) <= max_ar_dev):
+                        chosen_g = g
+                        break
+        if chosen_g is None:
+            # confirmation failed -> drop reseed f
+            keep.discard(f)
+            removed.append(f)
+        else:
+            # replace: drop reseed f, keep chosen_g
+            keep.discard(f)
+            removed.append(f)
+            replaced.append((f, chosen_g))
+    pruned = {k: v for k, v in best.items() if k in keep}
+    return pruned, removed, replaced
 
 
 def pred_with_kalman_or_hold(
@@ -150,11 +331,28 @@ def main():
         alt_path = os.path.splitext(out_path)[0] + ".avi"
         writer = cv2.VideoWriter(alt_path, fourcc, fps, (out_w, out_h))
         out_path = alt_path
+    # Debug JSONL of per-frame keep/filter status
+    dbg_jsonl_path = os.path.join(os.path.dirname(out_path) or ".", "ball_filter_debug.jsonl")
+    try:
+        dbg_f = open(dbg_jsonl_path, "w", encoding="utf-8")
+    except Exception:
+        dbg_f = None
 
     if ball_available:
-        best = load_best_ball_per_frame(jsonl_path, allowed)
+        best, dbg0 = build_ball_tracks(
+            jsonl_path=jsonl_path,
+            allowed_classes=allowed,
+            fps=fps,
+            settings=settings,
+        )
+        confirm_pruned_frames = dbg0.get("confirm_pruned", set())
+        retro_pruned_frames = dbg0.get("retro_pruned", set())
+        confirm_replaced_targets = dbg0.get("confirm_replaced_targets", set())
     else:
         best = {}
+        retro_pruned_frames = set()
+        confirm_pruned_frames = set()
+        confirm_replaced_targets = set()
 
     # Aspect-ratio soft weighting (no size constraints)
     f_min_ar = settings.FILTER_MIN_ASPECT_RATIO
@@ -189,7 +387,100 @@ def main():
     if softened > 0:
         print(f"AR soft-weight: adjusted {softened} frames by aspect-ratio; total {len(adjusted)}")
     best = adjusted
+
+    # Manual exclude list from env (e.g., "20-33,244,252")
+    frames_excluded_list = set(parse_frame_spec(settings.BALL_EXCLUDE_FRAMES))
+    if frames_excluded_list:
+        before = len(best)
+        best = {k: v for k, v in best.items() if k not in frames_excluded_list}
+        removed = before - len(best)
+        print(f"Manual exclude list: removed {removed} frames by BALL_EXCLUDE_FRAMES; kept {len(best)}")
+    # Early load of court timeseries for ROI gating (if available)
+    court_timeseries_early: Optional[Dict[int, List[Tuple[float, float]]]] = None
+    if settings.COURT_OVERLAY and os.path.exists(settings.COURT_TRACKING_JSONL):
+        court_timeseries_early = {}
+        try:
+            with open(settings.COURT_TRACKING_JSONL, "r", encoding="utf-8") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    fi = int(rec.get("frame", -1))
+                    cs = rec.get("corners")
+                    if fi >= 0 and cs and isinstance(cs, list) and len(cs) >= 4:
+                        pts = [(float(cs[0][0]), float(cs[0][1])), (float(cs[1][0]), float(cs[1][1])), (float(cs[2][0]), float(cs[2][1])), (float(cs[3][0]), float(cs[3][1]))]
+                        court_timeseries_early[fi] = pts
+        except Exception:
+            court_timeseries_early = None
+    # ROI gate: drop detections whose center lies outside court polygon (per-frame if available)
+    if court_timeseries_early and settings.COURT_ROI_FILTER:
+        filtered_roi = {}
+        roi_removed = 0
+        import numpy as _np
+        for k, p in best.items():
+            pts = court_timeseries_early.get(k)
+            if pts is None:
+                # fallback: try nearest previous
+                keys = [t for t in court_timeseries_early.keys() if t <= k]
+                if keys:
+                    pts = court_timeseries_early.get(max(keys))
+            if pts is not None and len(pts) == 4:
+                try:
+                    cnt = _np.array(pts, dtype=_np.int32).reshape((-1, 1, 2))
+                    cx, cy = int(round(float(p.get("x", 0.0)))), int(round(float(p.get("y", 0.0))))
+                    inside = cv2.pointPolygonTest(cnt, (cx, cy), False) >= 0
+                    if inside:
+                        filtered_roi[k] = p
+                    else:
+                        roi_removed += 1
+                except Exception:
+                    filtered_roi[k] = p
+            else:
+                filtered_roi[k] = p
+        if roi_removed > 0:
+            print(f"Court-ROI filter: removed {roi_removed} frames outside court; kept {len(filtered_roi)}")
+        best = filtered_roi
     frames_with_pred = sorted(best.keys())
+    # Keep a copy before manual/kinematic filtering for debug visualization
+    best_pre_kin = dict(adjusted)
+    # Optional kinematic filtering in image space (pre-smoothing)
+    if settings.KINEMATIC_FILTER_ENABLE and frames_with_pred:
+        best_before = len(best)
+        # Build warmup set: size gate disabled on reseed frames and confirm-replaced targets
+        warmup_frames = set(k for k, p in best.items() if isinstance(p, dict) and p.get("_reseed"))
+        try:
+            if 'confirm_replaced_targets' in locals():
+                warmup_frames |= set(confirm_replaced_targets)
+        except Exception:
+            pass
+        best = filter_by_kinematics(
+            best,
+            fps=fps,
+            max_speed_px_per_s=settings.KIN_MAX_SPEED_PX_PER_S,
+            max_accel_px_per_s2=settings.KIN_MAX_ACCEL_PX_PER_S2,
+            max_dir_change_deg=settings.KIN_MAX_DIR_CHANGE_DEG,
+            max_size_change_frac_per_s=settings.KIN_MAX_SIZE_FRAC_PER_S,
+            static_filter_enable=settings.KIN_STATIC_FILTER_ENABLE,
+            static_min_speed_px_per_s=settings.KIN_STATIC_MIN_SPEED_PX_PER_S,
+            static_min_frames=settings.KIN_STATIC_MIN_FRAMES,
+            enable_speed_gate=settings.KIN_ENABLE_SPEED_GATE,
+            enable_accel_gate=settings.KIN_ENABLE_ACCEL_GATE,
+            enable_dir_gate=settings.KIN_ENABLE_DIR_GATE,
+            enable_size_gate=settings.KIN_ENABLE_SIZE_GATE,
+            dyn_enable=settings.KIN_DYN_ENABLE,
+            dyn_min_mult=settings.KIN_DYN_MIN_MULT,
+            dyn_max_mult=settings.KIN_DYN_MAX_MULT,
+            warmup_disable_size_frames=warmup_frames,
+        )
+        removed = best_before - len(best)
+        if removed > 0:
+            print(f"Kinematic filter: removed {removed} implausible frames; kept {len(best)}")
+        frames_with_pred = sorted(best.keys())
+    # Debug sets
+    frames_raw = set(best_pre_kin.keys())
+    frames_kept = set(best.keys())
+    frames_filtered = frames_raw - frames_kept
     # Observation gating configuration
     gate_chisq = settings.OBS_GATE_CHISQ_THRESH
     gate_use_conf = settings.OBS_GATE_USE_CONF
@@ -197,7 +488,8 @@ def main():
     gravity_pps2 = settings.GRAVITY_PPS2
     # Convert to per-frame acceleration: g / fps^2
     gravity_per_frame = (gravity_pps2 / (fps * fps)) if fps and fps > 0 else 0.0
-    if ball_available and best:
+    smoothing_enable = settings.SMOOTHING_ENABLE
+    if ball_available and best and smoothing_enable:
         smoothed = kalman_rts_smooth(
             best,
             max_gap_frames,
@@ -211,6 +503,17 @@ def main():
     drawn = 0
     interp_count = 0
     hold_count = 0
+    # For evaluation: non-ball frames spec (not used for filtering)
+    eval_nonball = set(parse_frame_spec(settings.EVAL_NONBALL_FRAMES))
+    eval_enable = len(eval_nonball) > 0
+    eval_tp = eval_fn = eval_fp = eval_tn = 0
+    # Prepare domain for eval: only consider frames that had any raw candidate
+    eval_domain = set()
+    try:
+        # If we used continuity selection, raw domain approximated by best_pre_kin keys
+        eval_domain = set(best_pre_kin.keys())
+    except Exception:
+        pass
 
     # Load court overlay source
     court_corners: Optional[List[Tuple[float, float]]] = None
@@ -266,24 +569,125 @@ def main():
         if not ok:
             break
 
-        pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl) if ball_available else None
-        if pred is not None:
-            if float(pred.get("confidence", 0.0)) < min_conf:
-                pred = None
-        if pred is not None:
-            x, y, w, h = pred["x"], pred["y"], pred["width"], pred["height"]
-            x1, y1, x2, y2 = to_tlbr_from_xywh(x, y, w, h)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            if show_labels:
-                label = f"{pred.get('class','obj')} {pred.get('confidence', 0):.2f}"
-                if pred.get("_interp"):
-                    label += " (interp)"
-                    interp_count += 1
-                if pred.get("_hold"):
-                    label += " (hold)"
-                    hold_count += 1
-                cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-            drawn += 1
+        # HUD: show FPS and frame index for easier inspection
+        try:
+            hud_txt = f"FPS {fps:.2f} | frame {i}/{total_frames-1}"
+            cv2.putText(frame, hud_txt, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, hud_txt, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        except Exception:
+            pass
+
+        if smoothing_enable:
+            pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl) if ball_available else None
+            if pred is not None:
+                if float(pred.get("confidence", 0.0)) < min_conf:
+                    pred = None
+            if pred is not None:
+                x, y, w, h = pred["x"], pred["y"], pred["width"], pred["height"]
+                x1, y1, x2, y2 = to_tlbr_from_xywh(x, y, w, h)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                if show_labels:
+                    label = f"{pred.get('class','obj')} {pred.get('confidence', 0):.2f}"
+                    if pred.get("_interp"):
+                        label += " (interp)"
+                        interp_count += 1
+                    if pred.get("_hold"):
+                        label += " (hold)"
+                        hold_count += 1
+                    cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                drawn += 1
+        else:
+            # Raw per-frame visualization: draw near-ball keep/filter markers
+            raw = best_pre_kin.get(i)
+            had_raw = i in frames_raw
+            kept_raw = i in frames_kept
+            was_filtered = i in frames_filtered
+            # Optional court ROI masking in raw mode: if court timeseries available and we have corners
+            # treat detections outside the court polygon as filtered for visualization
+            if had_raw and settings.COURT_ROI_FILTER:
+                # choose corners for current frame if available; else last_court_pts if exists
+                poly_pts = None
+                if court_timeseries is not None and (i in court_timeseries or 'last_court_pts' in locals()):
+                    poly_pts = court_timeseries.get(i, last_court_pts)
+                if poly_pts is not None and len(poly_pts) == 4:
+                    try:
+                        import numpy as _np
+                        _cnt = _np.array(poly_pts, dtype=_np.int32).reshape((-1, 1, 2))
+                        cx, cy = int(round(float(raw.get("x", 0.0)))), int(round(float(raw.get("y", 0.0))))
+                        inside = cv2.pointPolygonTest(_cnt, (cx, cy), False) >= 0
+                        if not inside:
+                            kept_raw = False
+                            was_filtered = True
+                    except Exception:
+                        pass
+            if had_raw:
+                x, y, w, h = float(raw.get("x", 0.0)), float(raw.get("y", 0.0)), float(raw.get("width", 0.0)), float(raw.get("height", 0.0))
+                x1, y1, x2, y2 = to_tlbr_from_xywh(x, y, w, h)
+                conf_raw = float(raw.get("confidence", 0.0))
+                if kept_raw:
+                    # Draw green (or yellow if below conf) and tag near box
+                    if conf_raw >= min_conf:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), thickness)
+                        if show_labels:
+                            cv2.putText(frame, f"{conf_raw:.2f}", (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,0), 1, cv2.LINE_AA)
+                        tag = "KEPT"
+                        # mark reseed frames
+                        try:
+                            if isinstance(best.get(i), dict) and best.get(i, {}).get("_reseed"):
+                                tag = "KEPT (reseed)"
+                        except Exception:
+                            pass
+                        cv2.putText(frame, tag, (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,0), 2, cv2.LINE_AA)
+                        drawn += 1
+                    else:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), max(1, thickness-1))
+                        cv2.putText(frame, "KEPT<CONF", (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                else:
+                    # Filtered by manual list or kinematics: draw red thin box with EXCL/FILT near box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), max(1, thickness-1))
+                    tag = "EXCL" if i in frames_excluded_list else (
+                        "PRUNE" if ('retro_pruned_frames' in locals() and i in retro_pruned_frames) else (
+                        "CFM" if ('confirm_pruned_frames' in locals() and i in confirm_pruned_frames) else "FILT")
+                    )
+                    cv2.putText(frame, tag, (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+
+        # For smoothing-enabled path we already draw standard labels; for raw path we drew near-box status above.
+
+        # Write per-frame debug row (works for both modes)
+        if dbg_f is not None:
+            import json as _json
+            had_raw_dbg = i in frames_raw
+            kept_raw_dbg = i in frames_kept
+            filtered_dbg = had_raw_dbg and (i in frames_filtered)
+            conf_raw_dbg = 0.0
+            if had_raw_dbg:
+                try:
+                    conf_raw_dbg = float(best_pre_kin.get(i, {}).get("confidence", 0.0))
+                except Exception:
+                    conf_raw_dbg = 0.0
+            if smoothing_enable:
+                drawn_flag = bool('pred' in locals() and pred is not None)
+                interp_flag = bool(pred.get("_interp", False) if ('pred' in locals() and pred is not None) else False)
+                hold_flag = bool(pred.get("_hold", False) if ('pred' in locals() and pred is not None) else False)
+            else:
+                drawn_flag = bool(kept_raw_dbg and conf_raw_dbg >= min_conf)
+                interp_flag = False
+                hold_flag = False
+            dbg_row = {
+                "frame": i,
+                "had_raw": bool(had_raw_dbg),
+                "kept_by_kin": bool(kept_raw_dbg),
+                "filtered_by_kin": bool(filtered_dbg and i not in frames_excluded_list),
+                "excluded_by_list": bool(had_raw_dbg and (i in frames_excluded_list) and filtered_dbg),
+                "conf_raw": float(conf_raw_dbg),
+                "drawn": bool(drawn_flag),
+                "interp": bool(interp_flag),
+                "hold": bool(hold_flag),
+            }
+            try:
+                dbg_f.write(_json.dumps(dbg_row, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
         # Draw court
         pts: Optional[List[Tuple[float, float]]] = None
@@ -408,14 +812,45 @@ def main():
 
         if resize_needed:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        # Update evaluation stats (kept vs. not kept)
+        if eval_enable and ball_available and (i in eval_domain):
+            kept_now = (i in frames_kept) if not smoothing_enable else (i in smoothed)
+            is_nonball = (i in eval_nonball)
+            if is_nonball:
+                if kept_now:
+                    eval_fn += 1  # nonball but kept
+                else:
+                    eval_tp += 1  # nonball and filtered
+            else:
+                if kept_now:
+                    eval_tn += 1  # ball and kept
+                else:
+                    eval_fp += 1  # ball but filtered
+
         writer.write(frame)
         i += 1
 
     writer.release()
     cap.release()
+    if 'dbg_f' in locals() and dbg_f is not None:
+        try:
+            dbg_f.close()
+        except Exception:
+            pass
     print(
         f"Full overlay saved. Frames: {i}/{total_frames}, boxes: {drawn}, interp: {interp_count}, hold: {hold_count}. Output: {out_path}"
     )
+    if eval_enable:
+        # Report simple metrics for current video
+        total_nb = sum(1 for f in eval_domain if f in eval_nonball)
+        total_ball = max(0, len(eval_domain) - total_nb)
+        prec = (eval_tp / max(1, (eval_tp + eval_fp))) if (eval_tp + eval_fp) > 0 else 0.0
+        rec = (eval_tp / max(1, (eval_tp + eval_fn))) if (eval_tp + eval_fn) > 0 else 0.0
+        keep_rate = (eval_tn / max(1, total_ball)) if total_ball > 0 else 0.0
+        print(
+            f"Eval (non-ball detection): TP={eval_tp} FN={eval_fn} FP={eval_fp} TN={eval_tn} | non-ball total={total_nb}, ball total={total_ball}, precision={prec:.3f}, recall={rec:.3f}, ball-keep-rate={keep_rate:.3f}"
+        )
+    print(f"Debug JSONL saved: {dbg_jsonl_path}")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ pip install -r requirements.txt
 - 平滑与插值：`MAX_INTERP_GAP_FRAMES`，`HOLD_MODE`，`HOLD_TTL_FRAMES`
 - 门控与重力：`OBS_GATE_CHISQ_THRESH`，`OBS_GATE_USE_CONF`，`GRAVITY_PPS2`
 - 软权重过滤：`FILTER_MIN_ASPECT_RATIO`，`FILTER_MAX_ASPECT_RATIO`，`FILTER_AR_SOFT_ALPHA`
+- 运动学过滤（可选）：`KINEMATIC_FILTER_ENABLE`，`KIN_MAX_SPEED_PX_PER_S`，`KIN_MAX_ACCEL_PX_PER_S2`，`KIN_MAX_DIR_CHANGE_DEG`，`KIN_MAX_SIZE_FRAC_PER_S`
 - 球场叠加：`COURT_OVERLAY`，`COURT_OVERLAY_METHOD(=timeseries)`，`COURT_COLOR`，`COURT_THICKNESS`
   - 线条颜色扩展：`COURT_CENTER_COLOR`（中线，默认 0,255,255），`COURT_ATTACK_COLOR`（三米线，默认 255,0,255）
 
@@ -71,8 +72,28 @@ python3 scripts/run_overlay.py
 说明：
 - 逐帧读取原视频（保持原始帧率与时长）。
 - 使用 Kalman + RTS 对检测做插值和平滑；相邻观测间隔过大或首尾空窗时，启用“持有最近框（hold）”回退。
-- 支持“长宽比软权重”与“重力外推”提升遮挡段的外推质量。
+- 支持“长宽比软权重”“运动学过滤（可选）”与“重力外推”提升遮挡段的外推质量。
 - 输出 `outputs/ball_overlay_full.mp4`。
+
+### 运动学过滤（可选）
+启用后，将在平滑前按图像空间速度/加速度/转向/尺寸变化做硬门控，排除明显不可能为排球的帧。
+
+`.env` 示例参数：
+
+```
+KINEMATIC_FILTER_ENABLE=true
+# 建议根据视频分辨率与 FPS 微调
+KIN_MAX_SPEED_PX_PER_S=2200       # 最大像素速度
+KIN_MAX_ACCEL_PX_PER_S2=18000     # 最大像素加速度
+KIN_MAX_DIR_CHANGE_DEG=135        # 相邻速度向量允许的最大转角
+KIN_MAX_SIZE_FRAC_PER_S=4.0       # 每秒尺寸相对变化上限（宽/高分别检查）
+```
+
+说明：
+- 超过像素速度/加速度上限的帧直接丢弃；
+- 相邻速度向量转角过大（例如>135°）视为不连续，丢弃；
+- 尺寸变化速率过大（透视缩放不应突变）视为假阳性，丢弃；
+- 过滤在 Kalman+RTS 平滑之前生效，避免错误观测干扰轨迹。
 
 3) 场地“采集-处理”解耦与动态跟踪（推荐）：
 
