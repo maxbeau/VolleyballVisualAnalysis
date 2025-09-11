@@ -188,3 +188,26 @@ python3 scripts/run_trajectory_analysis.py
 - 先在图像坐标系内用 Kalman+RTS 融合（含可选重力外推/观测门控/hold 回退），再用单应性投影到球场平面；
 - 可选在球场坐标内再次做 2D 时序平滑（常速度模型），使轨迹更连续；
 - 米制换算依据 `court_homography.json` 的 `scale_px_per_meter`，默认 100px/m（18m×9m→1800×900）。
+
+---
+
+## 🛠️ 球场追踪增强与诊断（本次更新）
+
+- 追踪职责划分：
+  - LK/单应负责逐帧估计 `H_prev_curr` 并累积；
+  - Kalman 仅在关键帧融合 API 观测，帧间只做预测（不使用光流角点作为测量）。
+- 模板工具统一：`court/utils.py` 提供模板构建与打分；tracker 与 overlay 共用，降低分叉。
+- 自适应 ROI：基于上一帧位移中位数自适应放大/缩小 LK ROI，提速且稳健。
+- 尺度门控：限制每帧尺度变化（默认 ±8%），异常帧拒绝写入。
+- 自适应测量噪声：关键帧融合 Kalman 时按模板精度自适应测量噪声 R（高质量→更小 R）。
+- 诊断输出：`outputs/court_tracking.jsonl` 每帧写 `info` 指标，`COURT_SHOW_DIAG=true` 可在视频左上角显示关键指标（内点率、重投影误差、条件数、尺度、ROI 比例、模板精度、匹配数等）。
+
+可调环境变量（新增）：
+- `LK_ROI_EXPAND_RATIO`（默认 0.12）
+- `MAX_SCALE_CHANGE_PER_FRAME`（默认 0.08）
+- `KF_ADAPTIVE_FROM_TEMPLATE`（默认 true）
+- `KF_R_API_MIN`（默认 0.8）
+- `KF_R_API_MAX`（默认 2.5）
+- `COURT_SHOW_DIAG`（默认 false）
+
+以上均已在 `core/config.py` 读取，`court/processing.py` 注入 tracker。

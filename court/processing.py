@@ -481,7 +481,11 @@ def _load_detections(detections_jsonl: str) -> List[Dict[str, Any]]:
     return load_detections(detections_jsonl)
 
 
-## Kalman moved to court.tracker
+## Kalman and tracker implementation moved to court.tracker
+
+# Deprecated alias: ensure any import of CourtLKTracker from this module
+# resolves to the canonical implementation in court.tracker
+CourtLKTracker = ExtCourtLKTracker
 
 
 def run_tracking(
@@ -504,7 +508,13 @@ def run_tracking(
 
     # Build tracker with explicit overrides via kwargs
     tracker = ExtCourtLKTracker(
-        cfg=CourtTrackerConfig(),
+        cfg=CourtTrackerConfig(
+            lk_roi_expand_ratio=settings.LK_ROI_EXPAND_RATIO,
+            max_scale_change_per_frame=settings.MAX_SCALE_CHANGE_PER_FRAME,
+            kf_adaptive_from_template=settings.KF_ADAPTIVE_FROM_TEMPLATE,
+            kf_r_api_min=settings.KF_R_API_MIN,
+            kf_r_api_max=settings.KF_R_API_MAX,
+        ),
         use_homography=use_homography,
         ransac_reproj_thresh=ransac_thresh,
         hold_ttl_frames=hold_ttl,
@@ -557,8 +567,16 @@ def run_tracking(
 
                 if accept:
                     tracker.set_keyframe(frame_i, frame, det_corners)
-                    out_f.write(json.dumps({"frame": frame_i, "corners": det_corners}, ensure_ascii=False) + "\n")
-                    last_corners = det_corners
+                    # Write smoothed corners at keyframe to avoid a visual jump
+                    if tracker.ema_corners is not None:
+                        sm = [(float(x), float(y)) for x, y in order_corners(tracker.ema_corners.tolist())]
+                        info = {"keyframe": True, "tpl_prec": tracker.last_tpl_prec}
+                        out_f.write(json.dumps({"frame": frame_i, "corners": sm, "info": info}, ensure_ascii=False) + "\n")
+                        last_corners = sm
+                    else:
+                        info = {"keyframe": True, "tpl_prec": tracker.last_tpl_prec}
+                        out_f.write(json.dumps({"frame": frame_i, "corners": det_corners, "info": info}, ensure_ascii=False) + "\n")
+                        last_corners = det_corners
                 else:
                     # Reject suspicious keyframe; attempt tracking update instead
                     corners, info = tracker.update(frame)
@@ -577,12 +595,12 @@ def run_tracking(
                 # Regular frame: predict via LK+RANSAC
                 corners, info = tracker.update(frame)
                 if corners is not None:
-                    out_f.write(json.dumps({"frame": frame_i, "corners": corners}, ensure_ascii=False) + "\n")
+                    out_f.write(json.dumps({"frame": frame_i, "corners": corners, "info": info}, ensure_ascii=False) + "\n")
                     last_corners = corners
                 else:
                     # If tracker is in hold window and we have last corners, repeat for continuity
                     if info.get("hold") and info.get("hold_left", 0) > 0 and last_corners is not None:
-                        out_f.write(json.dumps({"frame": frame_i, "corners": last_corners}, ensure_ascii=False) + "\n")
+                        out_f.write(json.dumps({"frame": frame_i, "corners": last_corners, "info": info}, ensure_ascii=False) + "\n")
 
             frame_i += 1
 

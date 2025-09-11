@@ -4,7 +4,13 @@ import numpy as np
 import cv2
 
 from court.config import CourtTrackerConfig
-from court.utils import order_corners, apply_homography_points, compute_homography
+from court.utils import (
+    order_corners,
+    apply_homography_points,
+    compute_homography,
+    build_court_model_template,
+    template_precision_score,
+)
 
 
 Point = Tuple[float, float]
@@ -74,9 +80,19 @@ class MultiCornerKalman:
 
 class CourtLKTracker:
     """
-    Lightweight court tracker between sparse keyframes using LK optical flow
-    and robust motion estimation (affine/homography). Designed to minimize API
-    usage by filling frames between low-frequency detections.
+    Court tracker that fills frames between sparse keyframes using LK optical
+    flow + robust motion estimation.
+
+    Responsibilities are separated as follows:
+    - LK/robust model: estimate per-frame motion increment H_prev_curr from
+      prev_gray to gray with FB check + RANSAC, then accumulate into curr_H.
+    - Kalman: only updated on keyframes with high-quality API detections
+      (optionally with adaptive measurement noise R); between keyframes it
+      only predicts. We do NOT feed optical-flow "absolute corners" as
+      measurements to avoid reinforcing drift.
+    - Gating: geometry (ratio/area/jump), template precision, conditioning,
+      FB error, inlier stats, scale-change per frame.
+    - Refinement: cornerSubPix for the 4 corners projected by curr_H.
     """
 
     def __init__(self, cfg: Optional[CourtTrackerConfig] = None, **kwargs) -> None:
@@ -90,10 +106,11 @@ class CourtLKTracker:
         self.keyframe_idx: Optional[int] = None
         self.keyframe_gray: Optional[np.ndarray] = None
         self.keyframe_corners: Optional[np.ndarray] = None  # (4,2)
-        self.curr_H: Optional[np.ndarray] = None  # 3x3 mapping keyframe->current
+        self.curr_H: Optional[np.ndarray] = None  # 3x3 mapping keyframe->current (accumulated)
         self.prev_gray: Optional[np.ndarray] = None
         self.prev_pts: Optional[np.ndarray] = None  # (N,1,2) current-frame coords
-        self.orig_pts: Optional[np.ndarray] = None  # (N,1,2) keyframe coords
+        # In sliding-window mode we no longer need to carry keyframe-space points
+        self.orig_pts: Optional[np.ndarray] = None  # kept for compat; unused
         self.hold_left: int = 0
         self.ema_corners: Optional[np.ndarray] = None  # (4,2) stores smoothed corners
         self.ref_ratio: Optional[float] = None
@@ -104,6 +121,34 @@ class CourtLKTracker:
         self.model_template: Optional[np.ndarray] = None  # uint8 mask (W,H)
         # Kalman filter
         self.KF: Optional[MultiCornerKalman] = None
+
+        # Cached OpenCV params to avoid recreating tuples every frame
+        self._lk_win = (21, 21)
+        self._lk_levels = 3
+        self._lk_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        self._subpix_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.01)
+        # Throttle expensive template scoring: compute every N frames
+        self._tpl_stride = 2
+        self._tpl_tick = 0
+        # ROI dynamic scale factor (>=1.0)
+        self._roi_scale = 1.0
+        # Last template precision (for keyframes)
+        self.last_tpl_prec: Optional[float] = None
+
+    # ---------- adaptive KF helpers ----------
+    def _adaptive_kf_sigma(self, tscore: Optional[float]) -> float:
+        # Base sigma range
+        s_min = float(self.cfg.kf_r_api_min)
+        s_max = float(self.cfg.kf_r_api_max)
+        if tscore is None or not self.cfg.kf_adaptive_from_template:
+            return float(self.cfg.kalman_r_meas)
+        # Map template precision to [0,1]
+        # Use soft window: 0.2 -> 0, 0.7 -> 1
+        q = (float(tscore) - 0.2) / 0.5
+        q = max(0.0, min(1.0, q))
+        # Higher quality -> smaller sigma
+        sigma = s_max - (s_max - s_min) * q
+        return sigma
 
     # ---------- helpers ----------
     @staticmethod
@@ -174,32 +219,14 @@ class CourtLKTracker:
 
     def _build_model_template(self, model_size: Tuple[int, int], line_px: int) -> np.ndarray:
         W, H = model_size
-        canvas = np.zeros((H, W), dtype=np.uint8)
-        cv2.rectangle(canvas, (0, 0), (W - 1, H - 1), 255, thickness=line_px)
-        cy = int(round(H / 2))
-        cv2.line(canvas, (0, cy), (W - 1, cy), 255, thickness=line_px)
-        a1 = int(round(H * (1.5 / 9.0)))
-        a2 = int(round(H * (7.5 / 9.0)))
-        cv2.line(canvas, (0, a1), (W - 1, a1), 255, thickness=line_px)
-        cv2.line(canvas, (0, a2), (W - 1, a2), 255, thickness=line_px)
-        return canvas
+        return build_court_model_template(W, H, line_px=line_px, orientation="horizontal")
 
     def _template_precision_score(self, gray: np.ndarray, H_key_to_curr: np.ndarray) -> float:
         if self.H_key_img_to_model is None or self.model_template is None:
             return 1.0
         H_model_to_key = np.linalg.inv(self.H_key_img_to_model)
         H_model_to_curr = H_model_to_key @ H_key_to_curr
-        Hh, Ww = gray.shape[:2]
-        warped = cv2.warpPerspective(self.model_template, H_model_to_curr, (Ww, Hh), flags=cv2.INTER_NEAREST)
-        edges = cv2.Canny(gray, 50, 150)
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        tmask = warped > 0
-        if not np.any(tmask):
-            return 0.0
-        overlap = (edges > 0) & tmask
-        prec = float(overlap.sum()) / float(tmask.sum())
-        return prec
+        return template_precision_score(gray, H_model_to_curr, self.model_template)
 
     # ---------- API ----------
     def set_keyframe(self, frame_index: int, frame_bgr: np.ndarray, key_corners: List[Point]) -> None:
@@ -208,16 +235,13 @@ class CourtLKTracker:
         self.keyframe_idx = frame_index
         self.keyframe_gray = gray
         self.keyframe_corners = corners_ord
+        # Reset accumulated transform to identity at keyframe
         self.curr_H = np.eye(3, dtype=np.float64)
         self.prev_gray = gray
         self.prev_pts = self._seed_features(gray, corners_ord)
-        if self.prev_pts is not None and len(self.prev_pts) > 0:
-            self.orig_pts = self.prev_pts.copy()
-        else:
-            self.orig_pts = np.empty((0, 1, 2), dtype=np.float32)
+        # Sliding-window: no need to store keyframe-space correspondences
+        self.orig_pts = np.empty((0, 1, 2), dtype=np.float32)
         self.hold_left = self.cfg.hold_ttl_frames
-        self.ema_corners = corners_ord.astype(np.float64)
-        self.ref_ratio, self.ref_area = self._shape_metrics(corners_ord)
         # Build model mapping and template once per keyframe
         try:
             H_img2model, model_size = compute_homography(order_corners(corners_ord.tolist()))
@@ -228,11 +252,37 @@ class CourtLKTracker:
             self.H_key_img_to_model = None
             self.model_size = None
             self.model_template = None
-        # Init/Reset Kalman with keyframe
+        # Compute template precision score at keyframe (H=I)
+        tscore = None
+        try:
+            tscore = self._template_precision_score(gray, np.eye(3, dtype=np.float64))
+        except Exception:
+            tscore = None
+        self.last_tpl_prec = float(tscore) if tscore is not None else None
+        # Fuse keyframe detection into Kalman softly (do not reset velocity/state)
         if self.cfg.use_kalman:
+            sigma = self._adaptive_kf_sigma(tscore)
             if self.KF is None:
-                self.KF = MultiCornerKalman(q_pos=self.cfg.kalman_q_pos, q_vel=self.cfg.kalman_q_vel, r_meas=self.cfg.kalman_r_meas)
-            self.KF.reset(corners_ord)
+                self.KF = MultiCornerKalman(q_pos=self.cfg.kalman_q_pos, q_vel=self.cfg.kalman_q_vel, r_meas=sigma)
+                self.KF.reset(corners_ord)
+                self.ema_corners = corners_ord.astype(np.float64)
+            else:
+                # adapt R per-keyframe before update
+                self.KF.R = np.eye(8, dtype=np.float64) * (sigma ** 2)
+                smoothed = self.KF.update(corners_ord)
+                self.ema_corners = smoothed.astype(np.float64)
+        else:
+            # EMA fallback: blend toward new detection以避免大跳变
+            if self.ema_corners is None:
+                self.ema_corners = corners_ord.astype(np.float64)
+            else:
+                a = 0.6  # keep history more
+                self.ema_corners = self.ema_corners * a + corners_ord.astype(np.float64) * (1.0 - a)
+        # Update reference shape metrics gently to avoid abrupt resets
+        r_new, a_new = self._shape_metrics(corners_ord)
+        self.ref_ratio = r_new if self.ref_ratio is None else (0.9 * self.ref_ratio + 0.1 * r_new)
+        self.ref_area = a_new if self.ref_area is None else (0.9 * self.ref_area + 0.1 * a_new)
+        # Note: Kalman state was softly fused above; no hard reset here
 
     def update(self, frame_bgr: np.ndarray) -> Tuple[Optional[List[Point]], Dict[str, Any]]:
         info: Dict[str, Any] = {
@@ -249,7 +299,7 @@ class CourtLKTracker:
             return None, info
 
         gray = self._to_gray(frame_bgr)
-        # Track features from prev to curr
+        # Track features from prev to curr (prefer ROI LK with fallback to full-frame)
         if self.prev_pts is None or len(self.prev_pts) < 4:
             self.prev_pts = self._seed_features(self.prev_gray, self.keyframe_corners)
         if self.prev_pts is None or len(self.prev_pts) < 4:
@@ -257,12 +307,36 @@ class CourtLKTracker:
             self.hold_left = max(0, self.hold_left - 1)
             return None, info
 
-        next_pts, st, err = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, gray, self.prev_pts, None,
-            winSize=(21, 21), maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
-        st = st.reshape(-1) if st is not None else None
+        # ROI around previous smoothed corners to speed up LK and reduce drift
+        base_corners = (self.ema_corners if self.ema_corners is not None else self.keyframe_corners).astype(np.float32)
+        Hh, Ww = gray.shape[:2]
+        eff_expand = max(self.cfg.roi_expand_ratio, float(self.cfg.lk_roi_expand_ratio) * float(self._roi_scale))
+        rx1, ry1, rx2, ry2 = self._poly_roi_bounds(base_corners, eff_expand, Ww, Hh)
+        try:
+            prev_roi = self.prev_gray[ry1:ry2 + 1, rx1:rx2 + 1]
+            curr_roi = gray[ry1:ry2 + 1, rx1:rx2 + 1]
+            pts0 = self.prev_pts.reshape(-1, 2).astype(np.float32)
+            pts0_roi = (pts0 - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
+            next_pts_roi, st, err = cv2.calcOpticalFlowPyrLK(
+                prev_roi, curr_roi, pts0_roi, None,
+                winSize=self._lk_win, maxLevel=self._lk_levels,
+                criteria=self._lk_term,
+            )
+            st = st.reshape(-1) if st is not None else None
+            next_pts = (next_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2) if next_pts_roi is not None else None
+            used_roi = True
+        except Exception:
+            next_pts, st, err = None, None, None
+            used_roi = False
+        # Fallback to full-frame LK if ROI fails
+        if next_pts is None or st is None:
+            next_pts, st, err = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray, gray, self.prev_pts, None,
+                winSize=self._lk_win, maxLevel=self._lk_levels,
+                criteria=self._lk_term,
+            )
+            st = st.reshape(-1) if st is not None else None
+            used_roi = False
         if next_pts is None or st is None:
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
@@ -270,11 +344,21 @@ class CourtLKTracker:
 
         # Forward-backward check to prune unstable tracks
         try:
-            back_pts, st_back, _ = cv2.calcOpticalFlowPyrLK(
-                gray, self.prev_gray, next_pts, None,
-                winSize=(21, 21), maxLevel=3,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-            )
+            if used_roi:
+                # Backward on ROI as well
+                next_pts_roi = (next_pts.reshape(-1, 2) - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
+                back_pts_roi, st_back, _ = cv2.calcOpticalFlowPyrLK(
+                    curr_roi, prev_roi, next_pts_roi, None,
+                    winSize=self._lk_win, maxLevel=self._lk_levels,
+                    criteria=self._lk_term,
+                )
+                back_pts = (back_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2) if back_pts_roi is not None else None
+            else:
+                back_pts, st_back, _ = cv2.calcOpticalFlowPyrLK(
+                    gray, self.prev_gray, next_pts, None,
+                    winSize=self._lk_win, maxLevel=self._lk_levels,
+                    criteria=self._lk_term,
+                )
             st_back = st_back.reshape(-1) if st_back is not None else None
         except Exception:
             back_pts, st_back = None, None
@@ -295,42 +379,36 @@ class CourtLKTracker:
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
             return None, info
-
-        # Build keyframe->current correspondences using surviving tracks
-        if self.orig_pts is None or len(self.orig_pts) == 0:
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            return None, info
-        orig_all = self.orig_pts.reshape(-1, 2)
+        # Update ROI scale for next frame based on current displacement
         try:
-            orig_surv = orig_all[good]
+            disp = np.linalg.norm(p1 - p0, axis=1)
+            md = float(np.median(disp)) if disp.size > 0 else 0.0
+            # Map median displacement to target scale in [1.0, 1.8]
+            target = 1.0 + min(1.0, md / 12.0) * 0.8
+            self._roi_scale = float(np.clip(0.7 * self._roi_scale + 0.3 * target, 1.0, 2.0))
         except Exception:
-            orig_surv = orig_all[: len(p1)]
-        curr_surv = p1
-        if len(orig_surv) < 4:
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            return None, info
+            pass
 
-        # Estimate direct keyframe->current transform
+        # Estimate prev->curr transform (sliding window)
+        curr_surv = p1
         H = None
         M = None
         inliers = None
         if self.cfg.use_homography:
-            H, inliers = cv2.findHomography(orig_surv, curr_surv, cv2.RANSAC, ransacReprojThreshold=self.cfg.ransac_reproj_thresh)
-            info["method"] = "homography"
+            H, inliers = cv2.findHomography(p0, curr_surv, cv2.RANSAC, ransacReprojThreshold=self.cfg.ransac_reproj_thresh)
+            info["method"] = "homography(prev->curr)"
         else:
-            M, inliers = cv2.estimateAffinePartial2D(orig_surv, curr_surv, method=cv2.RANSAC, ransacReprojThreshold=self.cfg.ransac_reproj_thresh)
-            info["method"] = "affine"
+            M, inliers = cv2.estimateAffinePartial2D(p0, curr_surv, method=cv2.RANSAC, ransacReprojThreshold=self.cfg.ransac_reproj_thresh)
+            info["method"] = "affine(prev->curr)"
         inlier_count = int(inliers.sum()) if inliers is not None else 0
         info["inliers"] = inlier_count
-        info["inlier_ratio"] = float(inlier_count / max(1, len(orig_surv)))
+        info["inlier_ratio"] = float(inlier_count / max(1, len(p0)))
 
         if self.cfg.use_homography and H is not None:
-            curr_H = H.astype(np.float64)
+            H_prev_curr = H.astype(np.float64)
         elif (not self.cfg.use_homography) and M is not None:
-            curr_H = np.eye(3, dtype=np.float64)
-            curr_H[:2, :] = M
+            H_prev_curr = np.eye(3, dtype=np.float64)
+            H_prev_curr[:2, :] = M
         else:
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
@@ -338,14 +416,25 @@ class CourtLKTracker:
 
         # Quality checks: conditioning and median reprojection error
         try:
-            info["condH"] = float(np.linalg.cond(curr_H))
+            info["condH"] = float(np.linalg.cond(H_prev_curr))
         except Exception:
             info["condH"] = None
+        # Per-frame scale change gate (approx from unit basis vectors)
+        try:
+            basis0 = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+            basis1 = cv2.perspectiveTransform(basis0.reshape(-1, 1, 2), H_prev_curr).reshape(-1, 2)
+            sx = float(np.linalg.norm(basis1[1] - basis1[0]))
+            sy = float(np.linalg.norm(basis1[2] - basis1[0]))
+            lo = 1.0 - float(self.cfg.max_scale_change_per_frame)
+            hi = 1.0 + float(self.cfg.max_scale_change_per_frame)
+            s_ok = (lo <= sx <= hi) and (lo <= sy <= hi)
+        except Exception:
+            s_ok = True
         if inliers is not None and inlier_count > 0:
             mask = inliers.reshape(-1).astype(bool)
-            orig_in = orig_surv[mask]
+            prev_in = p0[mask]
             curr_in = curr_surv[mask]
-            proj = np.array(apply_homography_points([(float(x), float(y)) for x, y in orig_in], curr_H), dtype=np.float32)
+            proj = np.array(apply_homography_points([(float(x), float(y)) for x, y in prev_in], H_prev_curr), dtype=np.float32)
             errs = np.linalg.norm(curr_in - proj, axis=1)
             med_err = float(np.median(errs)) if errs.size > 0 else 1e9
         else:
@@ -355,22 +444,25 @@ class CourtLKTracker:
             or inlier_count < self.cfg.min_inliers
             or med_err > (self.cfg.ransac_reproj_thresh * 2.0)
             or (info["condH"] is not None and info["condH"] > 1e4)
+            or (not s_ok)
         ):
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
             return None, info
 
-        # Accept and set current H
-        self.curr_H = curr_H
+        # Accept: accumulate transform keyframe->current
+        self.curr_H = H_prev_curr @ self.curr_H
+        # Normalize to keep H numerically stable
+        if abs(self.curr_H[2, 2]) > 1e-12:
+            self.curr_H = self.curr_H / self.curr_H[2, 2]
 
         # Apply to keyframe corners
         curr_corners = np.array(apply_homography_points(self.keyframe_corners.tolist(), self.curr_H), dtype=np.float32)
         # Subpixel refine the 4 corners for better spatial stability
         try:
-            term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.01)
             win = (int(self.cfg.subpix_win), int(self.cfg.subpix_win))
             corners_nx1x2 = curr_corners.reshape(-1, 1, 2).astype(np.float32)
-            corners_ref = cv2.cornerSubPix(gray, corners_nx1x2, win, (-1, -1), term)
+            corners_ref = cv2.cornerSubPix(gray, corners_nx1x2, win, (-1, -1), self._subpix_term)
             if corners_ref is not None and len(corners_ref) == 4:
                 curr_corners = corners_ref.reshape(4, 2)
         except Exception:
@@ -391,29 +483,23 @@ class CourtLKTracker:
                 ok_geo = False
         # Optional template precision score (edge alignment)
         if ok_geo and self.cfg.use_template_score:
-            try:
-                tscore = self._template_precision_score(gray, self.curr_H)
-                info["tpl_prec"] = tscore
-                if tscore < self.cfg.template_min_precision:
-                    ok_geo = False
-            except Exception:
-                pass
+            do_score = (self._tpl_tick % max(1, int(self._tpl_stride))) == 0
+            if do_score:
+                try:
+                    tscore = self._template_precision_score(gray, self.curr_H)
+                    info["tpl_prec"] = tscore
+                    self.last_tpl_prec = float(tscore)
+                    if tscore < self.cfg.template_min_precision:
+                        ok_geo = False
+                except Exception:
+                    pass
+            self._tpl_tick = (self._tpl_tick + 1) % 1000000
         if not ok_geo:
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
             # reseed features around last good corners projected (ema or keyframe)
             base_corners = (self.ema_corners if self.ema_corners is not None else self.keyframe_corners).astype(np.float32)
             self.prev_pts = self._seed_features(gray, base_corners)
-            try:
-                Hinv = np.linalg.inv(self.curr_H)
-                if self.prev_pts is not None and len(self.prev_pts) > 0:
-                    pts = self.prev_pts.reshape(-1, 2)
-                    key_pts = np.array(apply_homography_points([(float(x), float(y)) for x, y in pts], Hinv), dtype=np.float32).reshape(-1, 1, 2)
-                    self.orig_pts = key_pts
-                else:
-                    self.orig_pts = np.empty((0, 1, 2), dtype=np.float32)
-            except Exception:
-                self.orig_pts = np.empty((0, 1, 2), dtype=np.float32)
             self.prev_gray = gray
             return None, info
 
@@ -421,28 +507,26 @@ class CourtLKTracker:
         if len(curr_surv) < self.cfg.reseed_min_tracks:
             info["reseed"] = True
             self.prev_pts = self._seed_features(gray, curr_corners)
-            if self.prev_pts is not None and len(self.prev_pts) > 0:
-                try:
-                    Hinv = np.linalg.inv(self.curr_H)
-                    pts = self.prev_pts.reshape(-1, 2)
-                    key_pts = np.array(apply_homography_points([(float(x), float(y)) for x, y in pts], Hinv), dtype=np.float32).reshape(-1, 1, 2)
-                    self.orig_pts = key_pts
-                except Exception:
-                    self.orig_pts = np.empty((0, 1, 2), dtype=np.float32)
-            else:
-                self.orig_pts = np.empty((0, 1, 2), dtype=np.float32)
         else:
             self.prev_pts = curr_surv.reshape(-1, 1, 2).astype(np.float32)
-            self.orig_pts = orig_surv.reshape(-1, 1, 2).astype(np.float32)
 
         # Step frame
         self.prev_gray = gray
         self.hold_left = self.cfg.hold_ttl_frames
 
-        # Kalman smoothing (fallback to EMA)
+        # Kalman prediction only (do not update with OF-derived measurement)
         if self.cfg.use_kalman and self.KF is not None:
-            smoothed = self.KF.update(curr_corners)
-            self.ema_corners = smoothed.astype(np.float64)
+            try:
+                self.KF.predict()
+                pos = (self.KF.H @ self.KF.x).reshape(4, 2)
+                self.ema_corners = pos.astype(np.float64)
+            except Exception:
+                # Fallback to EMA if Kalman state not ready
+                if self.ema_corners is None:
+                    self.ema_corners = curr_corners.astype(np.float64)
+                else:
+                    a = self.cfg.ema_alpha
+                    self.ema_corners = self.ema_corners * a + curr_corners.astype(np.float64) * (1.0 - a)
         else:
             if self.ema_corners is None:
                 self.ema_corners = curr_corners.astype(np.float64)
@@ -454,9 +538,17 @@ class CourtLKTracker:
         self.ref_ratio = r if self.ref_ratio is None else (self.ref_ratio * 0.98 + r * 0.02)
         self.ref_area = a if self.ref_area is None else (self.ref_area * 0.98 + a * 0.02)
 
+        # enrich info for diagnostics
+        info["roi_used"] = bool(used_roi)
+        info["roi_scale"] = float(self._roi_scale)
+        info["med_reproj_err"] = float(med_err)
+        try:
+            info["scale_x"] = float(sx)
+            info["scale_y"] = float(sy)
+        except Exception:
+            pass
         out_pts = [(float(x), float(y)) for x, y in order_corners(self.ema_corners.tolist())]
         return out_pts, info
 
 
 __all__ = ["CourtLKTracker", "MultiCornerKalman"]
-

@@ -26,6 +26,15 @@ class Settings:
         # Court Detection
         self.COURT_DETECTIONS_JSONL: str = os.getenv("COURT_DETECTIONS_JSONL", "outputs/court_detections.jsonl")
         self.COURT_TRACKING_JSONL: str = os.getenv("COURT_TRACKING_JSONL", "outputs/court_tracking.jsonl")
+        self.COURT_SAVE_JPEGS: bool = os.getenv("COURT_SAVE_JPEGS", "false").lower() == "true"
+        # Court tracker advanced params
+        self.LK_ROI_EXPAND_RATIO: float = float(os.getenv("LK_ROI_EXPAND_RATIO", "0.12"))
+        self.MAX_SCALE_CHANGE_PER_FRAME: float = float(os.getenv("MAX_SCALE_CHANGE_PER_FRAME", "0.08"))
+        self.KF_ADAPTIVE_FROM_TEMPLATE: bool = os.getenv("KF_ADAPTIVE_FROM_TEMPLATE", "true").lower() == "true"
+        self.KF_R_API_MIN: float = float(os.getenv("KF_R_API_MIN", "0.8"))
+        self.KF_R_API_MAX: float = float(os.getenv("KF_R_API_MAX", "2.5"))
+        # Overlay diagnostics
+        self.COURT_SHOW_DIAG: bool = os.getenv("COURT_SHOW_DIAG", "false").lower() == "true"
 
         # Overlay Output
         self.BALL_OVERLAY_FULL: str = os.getenv("BALL_OVERLAY_FULL", "outputs/ball_overlay_full.mp4")

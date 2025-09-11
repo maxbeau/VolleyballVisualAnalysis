@@ -5,6 +5,8 @@ from dataclasses import dataclass
 class CourtTrackerConfig:
     feature_max: int = 200
     roi_expand_ratio: float = 0.06
+    # Optical flow ROI比播种更大一些，减少大位移丢失
+    lk_roi_expand_ratio: float = 0.12
     ransac_reproj_thresh: float = 3.0
     min_inlier_ratio: float = 0.35
     min_inliers: int = 20
@@ -15,7 +17,11 @@ class CourtTrackerConfig:
     use_kalman: bool = True
     kalman_q_pos: float = 1e-2
     kalman_q_vel: float = 5e-2
-    kalman_r_meas: float = 2.0  # pixels std
+    kalman_r_meas: float = 2.0  # pixels std (default)
+    # Adaptive measurement noise (when updating with API detections)
+    kf_adaptive_from_template: bool = True
+    kf_r_api_min: float = 0.8   # lower std bound for high-quality detections
+    kf_r_api_max: float = 2.5   # upper std bound for low-quality detections
     ema_alpha: float = 0.85  # fallback if Kalman disabled
     # Geometry gates
     max_jump_px: float = 8.0
@@ -28,7 +34,8 @@ class CourtTrackerConfig:
     # Optical flow robustness
     fb_reproj_thresh: float = 1.2  # forward-backward error threshold (px)
     subpix_win: int = 5  # cornerSubPix half window size
+    # Per-frame motion sanity
+    max_scale_change_per_frame: float = 0.08  # allow ±8% scale change per frame
 
 
 __all__ = ["CourtTrackerConfig"]
-

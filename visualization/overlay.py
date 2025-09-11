@@ -5,7 +5,7 @@ import cv2
 import math
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
-from court.utils import standard_court_model_size
+from court.utils import standard_court_model_size, build_court_model_template, template_precision_score
 from core.config import settings
 from core.utils import ensure_dir
 from analysis.smoothing import kalman_rts_smooth
@@ -119,8 +119,9 @@ def main():
     court_center_color = settings.COURT_CENTER_COLOR
     court_attack_color = settings.COURT_ATTACK_COLOR
 
-    if not os.path.exists(jsonl_path):
-        raise FileNotFoundError(f"JSONL not found: {jsonl_path}. Run detect_ball.py first.")
+    ball_available = os.path.exists(jsonl_path)
+    if not ball_available:
+        print(f"Ball JSONL not found: {jsonl_path}. Proceeding without ball boxes.")
 
     video_path = settings.VIDEO_PATH
     cap = cv2.VideoCapture(video_path)
@@ -150,7 +151,10 @@ def main():
         writer = cv2.VideoWriter(alt_path, fourcc, fps, (out_w, out_h))
         out_path = alt_path
 
-    best = load_best_ball_per_frame(jsonl_path, allowed)
+    if ball_available:
+        best = load_best_ball_per_frame(jsonl_path, allowed)
+    else:
+        best = {}
 
     # Aspect-ratio soft weighting (no size constraints)
     f_min_ar = settings.FILTER_MIN_ASPECT_RATIO
@@ -193,13 +197,16 @@ def main():
     gravity_pps2 = settings.GRAVITY_PPS2
     # Convert to per-frame acceleration: g / fps^2
     gravity_per_frame = (gravity_pps2 / (fps * fps)) if fps and fps > 0 else 0.0
-    smoothed = kalman_rts_smooth(
-        best,
-        max_gap_frames,
-        gate_chisq,
-        gate_use_conf,
-        gravity_per_frame=gravity_per_frame,
-    )
+    if ball_available and best:
+        smoothed = kalman_rts_smooth(
+            best,
+            max_gap_frames,
+            gate_chisq,
+            gate_use_conf,
+            gravity_per_frame=gravity_per_frame,
+        )
+    else:
+        smoothed = {}
 
     drawn = 0
     interp_count = 0
@@ -208,9 +215,11 @@ def main():
     # Load court overlay source
     court_corners: Optional[List[Tuple[float, float]]] = None
     court_timeseries: Optional[Dict[int, List[Tuple[float, float]]]] = None
+    court_infos: Optional[Dict[int, Dict[str, Any]]] = None
     if court_overlay:
         if court_method == "timeseries" and os.path.exists(court_tracking_jsonl):
             court_timeseries = {}
+            court_infos = {}
             with open(court_tracking_jsonl, "r", encoding="utf-8") as cf:
                 for line in cf:
                     line = line.strip()
@@ -222,6 +231,8 @@ def main():
                     if fi >= 0 and cs and isinstance(cs, list) and len(cs) >= 4:
                         pts = [(float(cs[0][0]), float(cs[0][1])), (float(cs[1][0]), float(cs[1][1])), (float(cs[2][0]), float(cs[2][1])), (float(cs[3][0]), float(cs[3][1]))]
                         court_timeseries[fi] = pts
+                        if isinstance(rec.get("info"), dict):
+                            court_infos[fi] = rec["info"]
         elif os.path.exists(court_json):
             try:
                 with open(court_json, "r", encoding="utf-8") as cf:
@@ -234,20 +245,7 @@ def main():
                 court_corners = None
     # Precompute canonical court model size and line template
     Wm, Hm = standard_court_model_size(scale_px_per_meter=100.0)
-    def build_model_template(W: int, H: int, line_px: int = max(1, court_thickness)) -> np.ndarray:
-        mask = np.zeros((H, W), dtype=np.uint8)
-        # Border
-        cv2.rectangle(mask, (0, 0), (W - 1, H - 1), 255, thickness=line_px)
-        # Net (center) x = W/2
-        cx = int(round((W - 1) * 0.5))
-        cv2.line(mask, (cx, 0), (cx, H - 1), 255, thickness=line_px)
-        # Attack lines x= W*6/18 and x= W*12/18
-        a1 = int(round((W - 1) * (6.0 / 18.0)))
-        a2 = int(round((W - 1) * (12.0 / 18.0)))
-        cv2.line(mask, (a1, 0), (a1, H - 1), 255, thickness=line_px)
-        cv2.line(mask, (a2, 0), (a2, H - 1), 255, thickness=line_px)
-        return mask
-    model_tpl = build_model_template(Wm, Hm, max(1, court_thickness))
+    model_tpl = build_court_model_template(Wm, Hm, max(1, court_thickness), orientation="vertical")
 
     # Orientation temporal smoothing + hysteresis
     last_rot = 0  # 0,1,2,3 => 0,90,180,270 deg
@@ -262,12 +260,13 @@ def main():
 
     i = 0
     last_court_pts: Optional[List[Tuple[float, float]]] = None
+    last_court_info: Optional[Dict[str, Any]] = None
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl)
+        pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl) if ball_available else None
         if pred is not None:
             if float(pred.get("confidence", 0.0)) < min_conf:
                 pred = None
@@ -292,6 +291,8 @@ def main():
             if i in court_timeseries:
                 pts = court_timeseries.get(i)
                 last_court_pts = pts
+                if court_infos is not None:
+                    last_court_info = court_infos.get(i, last_court_info)
             else:
                 # Hold previous court corners if current frame missing
                 if last_court_pts is not None:
@@ -313,12 +314,7 @@ def main():
 
             def score_for(src: np.ndarray) -> Tuple[float, np.ndarray]:
                 Hmi = cv2.getPerspectiveTransform(src, dst)
-                warped = cv2.warpPerspective(model_tpl, Hmi, (frame.shape[1], frame.shape[0]), flags=cv2.INTER_NEAREST)
-                tmask = warped > 0
-                if not np.any(tmask):
-                    return 0.0, Hmi
-                overlap = (edges > 0) & tmask
-                prec = float(overlap.sum()) / float(tmask.sum())
+                prec = template_precision_score(gr, Hmi, model_tpl)
                 return prec, Hmi
 
             candidates = [src0, src90, src180, src270]
@@ -393,6 +389,22 @@ def main():
             a20, a21 = proj_vline(x_a2)
             cv2.line(frame, a10, a11, court_attack_color, max(1, court_thickness))
             cv2.line(frame, a20, a21, court_attack_color, max(1, court_thickness))
+
+            # Optional diagnostics
+            if settings.COURT_SHOW_DIAG and last_court_info is not None:
+                txt = []
+                def add(k):
+                    v = last_court_info.get(k)
+                    if v is not None:
+                        try:
+                            txt.append(f"{k}:{float(v):.3f}")
+                        except Exception:
+                            txt.append(f"{k}:{v}")
+                for k in ("inlier_ratio","med_reproj_err","condH","scale_x","scale_y","tpl_prec","roi_scale","matches","inliers"):
+                    add(k)
+                if txt:
+                    s = "  ".join(txt)
+                    cv2.putText(frame, s, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
 
         if resize_needed:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)

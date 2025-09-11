@@ -206,3 +206,59 @@ def apply_homography_points(
     Hm = np.asarray(H, dtype=np.float64)
     out = cv2.perspectiveTransform(arr, Hm).reshape(-1, 2)
     return [(float(x), float(y)) for x, y in out]
+
+
+# ------------- Template utilities (shared by tracker and overlay) -------------
+def build_court_model_template(W: int, H: int, line_px: int = 2, orientation: str = "horizontal"):
+    """
+    Builds a binary mask template (H,W) for a volleyball court model.
+    - orientation="horizontal": border + three HORIZONTAL lines (used by tracker)
+    - orientation="vertical": border + three VERTICAL lines (used by overlay)
+    """
+    cv2 = _cv2()
+    import numpy as np
+    W = int(max(2, W)); H = int(max(2, H))
+    m = np.zeros((H, W), dtype=np.uint8)
+    # Outer border
+    cv2.rectangle(m, (0, 0), (W - 1, H - 1), 255, thickness=max(1, line_px))
+    if orientation == "horizontal":
+        # Net (center) horizontal line at H/2
+        cy = int(round((H - 1) * 0.5))
+        cv2.line(m, (0, cy), (W - 1, cy), 255, thickness=max(1, line_px))
+        # Attack lines at 1.5m and 7.5m over total height 9m => y=H*(1.5/9), H*(7.5/9)
+        a1 = int(round((H - 1) * (1.5 / 9.0)))
+        a2 = int(round((H - 1) * (7.5 / 9.0)))
+        cv2.line(m, (0, a1), (W - 1, a1), 255, thickness=max(1, line_px))
+        cv2.line(m, (0, a2), (W - 1, a2), 255, thickness=max(1, line_px))
+    else:
+        # Net (center) vertical line at W/2
+        cx = int(round((W - 1) * 0.5))
+        cv2.line(m, (cx, 0), (cx, H - 1), 255, thickness=max(1, line_px))
+        # Attack lines at x = W*(6/18) and x = W*(12/18)
+        a1 = int(round((W - 1) * (6.0 / 18.0)))
+        a2 = int(round((W - 1) * (12.0 / 18.0)))
+        cv2.line(m, (a1, 0), (a1, H - 1), 255, thickness=max(1, line_px))
+        cv2.line(m, (a2, 0), (a2, H - 1), 255, thickness=max(1, line_px))
+    return m
+
+
+def template_precision_score(gray, H_model_to_img, template_mask) -> float:
+    """
+    Precision score of template edges aligned to image edges:
+    precision = overlap(edge(gray), warp(template_mask, H)) / area(template_mask)
+    """
+    cv2 = _cv2()
+    import numpy as np
+    try:
+        Hh, Ww = gray.shape[:2]
+        warped = cv2.warpPerspective(template_mask, H_model_to_img, (Ww, Hh), flags=cv2.INTER_NEAREST)
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        tmask = warped > 0
+        if not np.any(tmask):
+            return 0.0
+        overlap = (edges > 0) & tmask
+        prec = float(overlap.sum()) / float(tmask.sum())
+        return prec
+    except Exception:
+        return 0.0
