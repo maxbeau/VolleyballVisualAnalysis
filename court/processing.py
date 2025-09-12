@@ -11,6 +11,7 @@ from core.utils import ensure_dir
 from court.utils import order_corners, shape_metrics, within_tol
 from court.config import CourtTrackerConfig
 from court.tracker import CourtLKTracker  # canonical implementation
+from court.orientation import decide_orientation as decide_court_orientation
 from court.io import load_detections
 
 
@@ -59,6 +60,9 @@ def run_tracking(
     next_key_frame = int(next_key["frame"]) if next_key else None
     prev_det_corners: Optional[List[Point]] = None
 
+    # Collect a lightweight in-memory timeseries to compute orientation meta after tracking
+    timeseries: Dict[int, List[Point]] = {}
+
     with open(tracking_jsonl, "w", encoding="utf-8") as out_f:
         frame_i = 0
         last_corners: Optional[List[Point]] = None
@@ -106,18 +110,22 @@ def run_tracking(
                         info = {"keyframe": True, "tpl_prec": getattr(tracker, "last_tpl_prec", None)}
                         out_f.write(json.dumps({"frame": frame_i, "corners": sm, "info": info}, ensure_ascii=False) + "\n")
                         last_corners = sm
+                        timeseries[frame_i] = sm
                     else:
                         info = {"keyframe": True, "tpl_prec": getattr(tracker, "last_tpl_prec", None)}
                         out_f.write(json.dumps({"frame": frame_i, "corners": det_corners, "info": info}, ensure_ascii=False) + "\n")
                         last_corners = det_corners
+                        timeseries[frame_i] = det_corners
                 else:
                     # Reject suspicious keyframe; attempt tracking update instead
                     corners, info = tracker.update(frame)
                     if corners is not None:
                         out_f.write(json.dumps({"frame": frame_i, "corners": corners}, ensure_ascii=False) + "\n")
                         last_corners = corners
+                        timeseries[frame_i] = corners
                     elif last_corners is not None:
                         out_f.write(json.dumps({"frame": frame_i, "corners": last_corners}, ensure_ascii=False) + "\n")
+                        timeseries[frame_i] = last_corners
 
                 # advance to next detection
                 det_idx += 1
@@ -130,14 +138,46 @@ def run_tracking(
                 if corners is not None:
                     out_f.write(json.dumps({"frame": frame_i, "corners": corners, "info": info}, ensure_ascii=False) + "\n")
                     last_corners = corners
+                    timeseries[frame_i] = corners
                 else:
                     # If tracker is in hold window and we have last corners, repeat for continuity
                     if info.get("hold") and info.get("hold_left", 0) > 0 and last_corners is not None:
                         out_f.write(json.dumps({"frame": frame_i, "corners": last_corners, "info": info}, ensure_ascii=False) + "\n")
+                        timeseries[frame_i] = last_corners
 
             frame_i += 1
 
     cap.release()
+
+    # Export orientation meta (avoid recomputing in visualization)
+    try:
+        # Compact ts for orientation: frame -> {"corners": [(x,y)*4]}
+        ts_for_orient: Dict[int, Dict[str, Any]] = {}
+        SAMPLE_MAX = 600
+        for fi in sorted(timeseries.keys()):
+            if fi > SAMPLE_MAX:
+                break
+            cs = timeseries[fi]
+            if cs and len(cs) >= 4:
+                ts_for_orient[int(fi)] = {"corners": [(float(cs[0][0]), float(cs[0][1])),
+                                                       (float(cs[1][0]), float(cs[1][1])),
+                                                       (float(cs[2][0]), float(cs[2][1])),
+                                                       (float(cs[3][0]), float(cs[3][1]))]}
+
+        cap2 = cv2.VideoCapture(video_path)
+        # standard model size; exact px/m not critical for template voting
+        model_W, model_H = (1800, 900)
+        orient = decide_court_orientation(cap2, ts_for_orient, (model_W, model_H), mode=settings.COURT_MINI_ORIENT_MODE)
+        cap2.release()
+        meta = {
+            "tracking_jsonl": tracking_jsonl,
+            "orientation": orient,
+        }
+        ensure_dir(os.path.dirname(settings.COURT_TRACKING_META) or ".")
+        with open(settings.COURT_TRACKING_META, "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def main():
@@ -162,6 +202,7 @@ def main():
     parser.add_argument("--lk-roi-expand-ratio", type=float, default=None, help="LK ROI expand ratio (tracking)")
     parser.add_argument("--reseed-min-tracks", type=int, default=None, help="Reseed when surviving tracks less than this")
     parser.add_argument("--subpix-win", type=int, default=None, help="cornerSubPix half window size")
+    parser.add_argument("--subpix-stride", type=int, default=None, help="Refine subpixel corners every N frames")
 
     # Geometry gating
     parser.add_argument("--max-jump-px", type=float, default=None, help="Max median corner jump vs EMA (px)")
@@ -173,6 +214,7 @@ def main():
     parser.add_argument("--no-template-score", dest="use_template_score", action="store_false", help="Disable template precision gating")
     parser.add_argument("--template-line-px", type=int, default=None, help="Template line thickness (px)")
     parser.add_argument("--template-min-precision", type=float, default=None, help="Minimum template precision to accept frame")
+    parser.add_argument("--template-stride", type=int, default=None, help="Compute template precision every N frames")
 
     # Smoothing / Kalman
     parser.add_argument("--use-kalman", dest="use_kalman", action="store_true", default=None, help="Enable Kalman smoothing")
@@ -184,6 +226,20 @@ def main():
     parser.add_argument("--no-kf-adaptive-from-template", dest="kf_adaptive_from_template", action="store_false", help="Disable adaptive R from template precision")
     parser.add_argument("--kf-r-api-min", type=float, default=None, help="Lower bound of adaptive measurement sigma")
     parser.add_argument("--kf-r-api-max", type=float, default=None, help="Upper bound of adaptive measurement sigma")
+    # New performance/robustness options
+    parser.add_argument("--use-roi-downsample", dest="use_roi_downsample", action="store_true", default=None, help="Enable ROI downsample for LK")
+    parser.add_argument("--no-roi-downsample", dest="use_roi_downsample", action="store_false", help="Disable ROI downsample for LK")
+    parser.add_argument("--roi-downsample-scale", type=float, default=None, help="ROI downsample scale (e.g., 0.5)")
+    parser.add_argument("--early-motion-gate", dest="early_motion_gate", action="store_true", default=None, help="Enable early motion gate to skip LK")
+    parser.add_argument("--no-early-motion-gate", dest="early_motion_gate", action="store_false", help="Disable early motion gate")
+    parser.add_argument("--early-motion-mad-gray-thr", type=float, default=None, help="Early motion gate MAD gray threshold")
+    parser.add_argument("--fallback-affine", dest="model_fallback_affine_on_fail", action="store_true", default=None, help="Try affine fallback when homography fails gates")
+    parser.add_argument("--no-fallback-affine", dest="model_fallback_affine_on_fail", action="store_false", help="Disable affine fallback")
+    parser.add_argument("--kalman-q-scale-from-motion", dest="kalman_q_scale_from_motion", action="store_true", default=None, help="Adapt Kalman Q scale from motion magnitude")
+    parser.add_argument("--no-kalman-q-scale-from-motion", dest="kalman_q_scale_from_motion", action="store_false", help="Disable Q adaptation")
+    parser.add_argument("--kalman-q-scale-lo", type=float, default=None, help="Lower bound of Kalman Q scale")
+    parser.add_argument("--kalman-q-scale-hi", type=float, default=None, help="Upper bound of Kalman Q scale")
+    parser.add_argument("--motion-md-ref-px", type=float, default=None, help="Reference median displacement (px) for Q scale mapping")
     args = parser.parse_args()
 
     # Resolve method flags
@@ -217,6 +273,8 @@ def main():
         cfg.reseed_min_tracks = int(args.reseed_min_tracks)
     if args.subpix_win is not None:
         cfg.subpix_win = int(args.subpix_win)
+    if args.subpix_stride is not None:
+        cfg.subpix_stride = int(args.subpix_stride)
     # Geometry gates
     if args.max_jump_px is not None:
         cfg.max_jump_px = float(args.max_jump_px)
@@ -231,6 +289,8 @@ def main():
         cfg.template_line_px = int(args.template_line_px)
     if args.template_min_precision is not None:
         cfg.template_min_precision = float(args.template_min_precision)
+    if args.template_stride is not None:
+        cfg.template_stride = int(args.template_stride)
     # Kalman
     if args.use_kalman is not None:
         cfg.use_kalman = bool(args.use_kalman)
@@ -246,6 +306,25 @@ def main():
     cfg.kf_r_api_max = float(args.kf_r_api_max if args.kf_r_api_max is not None else settings.KF_R_API_MAX)
     if args.max_scale_change_per_frame is not None:
         cfg.max_scale_change_per_frame = float(args.max_scale_change_per_frame)
+    # New performance/robustness options
+    if args.use_roi_downsample is not None:
+        cfg.use_roi_downsample = bool(args.use_roi_downsample)
+    if args.roi_downsample_scale is not None:
+        cfg.roi_downsample_scale = float(args.roi_downsample_scale)
+    if args.early_motion_gate is not None:
+        cfg.early_motion_gate = bool(args.early_motion_gate)
+    if args.early_motion_mad_gray_thr is not None:
+        cfg.early_motion_mad_gray_thr = float(args.early_motion_mad_gray_thr)
+    if args.model_fallback_affine_on_fail is not None:
+        cfg.model_fallback_affine_on_fail = bool(args.model_fallback_affine_on_fail)
+    if args.kalman_q_scale_from_motion is not None:
+        cfg.kalman_q_scale_from_motion = bool(args.kalman_q_scale_from_motion)
+    if args.kalman_q_scale_lo is not None:
+        cfg.kalman_q_scale_lo = float(args.kalman_q_scale_lo)
+    if args.kalman_q_scale_hi is not None:
+        cfg.kalman_q_scale_hi = float(args.kalman_q_scale_hi)
+    if args.motion_md_ref_px is not None:
+        cfg.motion_md_ref_px = float(args.motion_md_ref_px)
 
     run_tracking(
         video_path=settings.VIDEO_PATH,

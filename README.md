@@ -136,7 +136,7 @@ KIN_MAX_SIZE_FRAC_PER_S=4.0       # 每秒尺寸相对变化上限（宽/高分�
 - 尺寸变化速率过大（透视缩放不应突变）视为假阳性，丢弃；
 - 过滤在 Kalman+RTS 平滑之前生效，避免错误观测干扰轨迹。
 
-3) 场地“采集-处理”解耦与动态跟踪（推荐）：
+4) 场地“采集-处理”解耦与动态跟踪（推荐）：
 
 - 采集（仅云推理与缓存，不做融合）：
 ```bash
@@ -153,6 +153,55 @@ python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detecti
 - 采集阶段采用内存推理（避免磁盘 I/O）；如需缓存采样帧 JPEG，可在 `.env` 设 `COURT_SAVE_JPEGS=true`。
 
 ---
+
+## 🏟️ 球场完整流程（Detection → Tracking → Homography）
+
+1) 低频采集关键帧 + 模板打分（可选门控）
+```bash
+python3 scripts/run_court_detect.py --use-template-score
+# 更严格： --gate-by-template --template-min-precision 0.30
+```
+输出：`outputs/court_detections.jsonl`
+
+2) 逐帧跟踪（Balanced 默认）
+```bash
+python3 scripts/run_court_processing.py
+python3 scripts/preview_court_tracking.py  # 预览 -> outputs/court_tracking_preview.mp4
+```
+输出：`outputs/court_tracking.jsonl`
+
+3) 导出单应性与鸟瞰图
+```bash
+python3 scripts/run_court_homography.py --tracking-jsonl outputs/court_tracking.jsonl
+```
+输出：
+- `outputs/court_homography.npy` / `outputs/court_homography.json`
+- `outputs/court_birdseye.jpg`
+
+### 预设对比（可复现）
+- Balanced（默认）
+```bash
+python3 scripts/run_court_processing.py \
+  --template-stride 3 --subpix-stride 3 \
+  --use-roi-downsample --roi-downsample-scale 0.5 \
+  --early-motion-gate --early-motion-mad-gray-thr 2.5 \
+  --fallback-affine --kalman-q-scale-from-motion \
+  --kalman-q-scale-lo 1.0 --kalman-q-scale-hi 6.0 --motion-md-ref-px 12.0
+```
+- Energy saver：增大 stride、保留降采样与早停
+- Accuracy：关闭降采样和早停，`--subpix-stride 1`
+
+预览任意时序：
+```bash
+python3 scripts/preview_court_tracking.py --tracking-jsonl <path> --out <video>
+```
+
+### Balanced 关键默认（见 `court/config.py`）
+- `use_roi_downsample=True`, `roi_downsample_scale=0.5`
+- `early_motion_gate=True`, `early_motion_mad_gray_thr=2.5`
+- `template_stride=3`, `subpix_stride=3`
+- `model_fallback_affine_on_fail=True`
+- `kalman_q_scale_from_motion=True`（1.0→6.0，`motion_md_ref_px=12.0`）
 
 ## 📁 关键文件
 - `ball/detect.py`：Roboflow 抽帧检测、缓存与 JSONL 汇总
@@ -189,6 +238,41 @@ python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detecti
 - 门控与重力：`OBS_GATE_CHISQ_THRESH`，`OBS_GATE_USE_CONF`，`GRAVITY_PPS2`
 - 软权重过滤：`FILTER_MIN_ASPECT_RATIO`，`FILTER_MAX_ASPECT_RATIO`，`FILTER_AR_SOFT_ALPHA`
 - 球场叠加：`COURT_OVERLAY`，`COURT_OVERLAY_METHOD(=timeseries)`，`COURT_COLOR`，`COURT_THICKNESS`
+
+---
+
+## 🧩 可视化模块与配置
+
+模块结构：
+- `court/orientation.py`：统一“球场方向”判定（horizontal/vertical），支持 template/geometry/force。
+- `visualization/court_overlay.py`：场地渲染器（外边框 + 中线/三米线），内部负责 0/90/180/270 旋转评分、EMA 平滑与迟滞锁定。
+- `visualization/mini_birdseye.py`：迷你鸟瞰渲染（抽象模板 + 可选当前帧小四边形）。
+- `visualization/hud.py`：HUD 工具（FPS/文字气泡）。
+
+可视化相关 .env 开关（新增/关键）：
+- `COURT_TRACKING_META=outputs/court_tracking_meta.json`  # 跟踪流程输出的方向元数据
+- `COURT_MINI_ENABLE=true`                                # 是否在右上角叠加迷你鸟瞰
+- `COURT_MINI_ORIENT_MODE=template`                       # template|geometry|force_horizontal|force_vertical
+- `COURT_MINI_SHOW_LABEL=true`                            # 是否显示 horizontal/vertical 标签
+- `COURT_MINI_PLACEMENT=top-right`                        # 迷你鸟瞰位置：top-right|top-left|bottom-right|bottom-left
+- `COURT_MINI_SCALE=0.24`                                 # 尺度：横向按宽度比例，纵向按高度比例
+- `COURT_MINI_DRAW_POLY=true`                             # 在迷你鸟瞰内绘制当前帧小四边形
+
+示例流程：
+1) 生成跟踪与方向元信息
+```bash
+python3 scripts/run_court_processing.py
+cat outputs/court_tracking_meta.json  # { "orientation": "horizontal" | "vertical" }
+```
+2) 预览可视化（受上述开关影响）
+```bash
+python3 scripts/preview_court_tracking.py --tracking-jsonl outputs/court_tracking.jsonl
+```
+3) 最终叠加（右上角迷你鸟瞰与主场地渲染风格一致）
+```bash
+python3 scripts/run_overlay.py
+```
+
 
 ---
 

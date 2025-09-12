@@ -26,7 +26,12 @@ class Settings:
         # Court Detection
         self.COURT_DETECTIONS_JSONL: str = os.getenv("COURT_DETECTIONS_JSONL", "outputs/court_detections.jsonl")
         self.COURT_TRACKING_JSONL: str = os.getenv("COURT_TRACKING_JSONL", "outputs/court_tracking.jsonl")
+        self.COURT_TRACKING_META: str = os.getenv("COURT_TRACKING_META", "outputs/court_tracking_meta.json")
         self.COURT_SAVE_JPEGS: bool = os.getenv("COURT_SAVE_JPEGS", "false").lower() == "true"
+        # Court detection quality (template precision gating)
+        self.COURT_DET_USE_TEMPLATE_SCORE: bool = os.getenv("COURT_DET_USE_TEMPLATE_SCORE", "true").lower() == "true"
+        self.COURT_DET_MIN_TEMPLATE_PREC: float = float(os.getenv("COURT_DET_MIN_TEMPLATE_PREC", "0.28"))
+        self.COURT_DET_TEMPLATE_LINE_PX: int = int(os.getenv("COURT_DET_TEMPLATE_LINE_PX", "8"))
         # Court tracker advanced params
         self.LK_ROI_EXPAND_RATIO: float = float(os.getenv("LK_ROI_EXPAND_RATIO", "0.12"))
         self.MAX_SCALE_CHANGE_PER_FRAME: float = float(os.getenv("MAX_SCALE_CHANGE_PER_FRAME", "0.08"))
@@ -89,6 +94,18 @@ class Settings:
         self.COURT_OVERLAY_METHOD: str = os.getenv("COURT_OVERLAY_METHOD", "timeseries")
         self.COURT_COLOR: tuple = tuple(map(int, os.getenv("COURT_COLOR", "0,255,0").split(',')))
         self.COURT_THICKNESS: int = int(os.getenv("COURT_THICKNESS", "2"))
+        # Mini bird's-eye overlay (preview/overlay)
+        self.COURT_MINI_ENABLE: bool = os.getenv("COURT_MINI_ENABLE", "true").lower() == "true"
+        # Orientation mode: template | geometry | force_horizontal | force_vertical
+        self.COURT_MINI_ORIENT_MODE: str = os.getenv("COURT_MINI_ORIENT_MODE", "template")
+        # Show orientation label text near the mini bird's-eye
+        self.COURT_MINI_SHOW_LABEL: bool = os.getenv("COURT_MINI_SHOW_LABEL", "true").lower() == "true"
+        # Placement and scale
+        self.COURT_MINI_PLACEMENT: str = os.getenv("COURT_MINI_PLACEMENT", "top-right")
+        # For horizontal orientation, treated as width fraction; for vertical, height fraction
+        self.COURT_MINI_SCALE: float = float(os.getenv("COURT_MINI_SCALE", "0.24"))
+        # Draw polygon of current corners inside mini-viewport
+        self.COURT_MINI_DRAW_POLY: bool = os.getenv("COURT_MINI_DRAW_POLY", "true").lower() == "true"
         # Extra court lines (center and 3m attack lines)
         self.COURT_CENTER_COLOR: tuple = tuple(map(int, os.getenv("COURT_CENTER_COLOR", "0,255,255").split(',')))
         self.COURT_ATTACK_COLOR: tuple = tuple(map(int, os.getenv("COURT_ATTACK_COLOR", "255,0,255").split(',')))

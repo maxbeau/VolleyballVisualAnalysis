@@ -79,6 +79,19 @@ class MultiCornerKalman:
         pos = (self.H @ self.x).reshape(4, 2)
         return pos
 
+    def set_process_scale(self, scale: float) -> None:
+        """Rebuild process noise Q using base q_pos/q_vel scaled by factor."""
+        try:
+            s = float(scale)
+            if s <= 0:
+                s = 1.0
+            I8 = np.eye(8)
+            Qpos = I8 * (self.q_pos * s)
+            Qvel = I8 * (self.q_vel * s)
+            self.Q = np.block([[Qpos, np.zeros((8, 8))], [np.zeros((8, 8)), Qvel]])
+        except Exception:
+            pass
+
 
 class CourtLKTracker:
     """
@@ -129,13 +142,15 @@ class CourtLKTracker:
         self._lk_levels = 3
         self._lk_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         self._subpix_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.01)
-        # Throttle expensive template scoring: compute every N frames
-        self._tpl_stride = 2
+        # Throttle expensive template scoring: compute every N frames (configurable)
+        self._tpl_stride = int(self.cfg.template_stride)
         self._tpl_tick = 0
         # ROI dynamic scale factor (>=1.0)
         self._roi_scale = 1.0
         # Last template precision (for keyframes)
         self.last_tpl_prec: Optional[float] = None
+        # Frame tick for throttling certain ops (e.g., subpix)
+        self._frame_tick: int = 0
 
     # ---------- adaptive KF helpers ----------
     def _adaptive_kf_sigma(self, tscore: Optional[float]) -> float:
@@ -306,13 +321,55 @@ class CourtLKTracker:
         try:
             prev_roi = self.prev_gray[ry1:ry2 + 1, rx1:rx2 + 1]
             curr_roi = gray[ry1:ry2 + 1, rx1:rx2 + 1]
+            # Early motion gate: skip LK if ROI nearly static
+            if self.cfg.early_motion_gate:
+                try:
+                    mad = float(np.mean(np.abs(curr_roi.astype(np.int16) - prev_roi.astype(np.int16))))
+                    info["roi_mad"] = mad
+                    if mad <= float(self.cfg.early_motion_mad_gray_thr):
+                        # Predict only and output EMA/current projection
+                        if self.cfg.use_kalman and self.KF is not None:
+                            try:
+                                self.KF.predict()
+                                pos = (self.KF.H @ self.KF.x).reshape(4, 2)
+                                self.ema_corners = pos.astype(np.float64)
+                            except Exception:
+                                pass
+                        if self.ema_corners is None:
+                            base = np.array(apply_homography_points(self.keyframe_corners.tolist(), self.curr_H), dtype=np.float32)
+                        else:
+                            base = self.ema_corners.astype(np.float32)
+                        out_pts = [(float(x), float(y)) for x, y in order_corners(base.tolist())]
+                        info["early_stop"] = True
+                        self.prev_gray = gray
+                        self.hold_left = self.cfg.hold_ttl_frames
+                        self._frame_tick = (self._frame_tick + 1) % 1000000
+                        return out_pts, info
+                except Exception:
+                    pass
             pts0 = self.prev_pts.reshape(-1, 2).astype(np.float32)
             pts0_roi = (pts0 - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-            next_pts_roi, st, err = cv2.calcOpticalFlowPyrLK(
-                prev_roi, curr_roi, pts0_roi, None,
-                winSize=self._lk_win, maxLevel=self._lk_levels,
-                criteria=self._lk_term,
-            )
+            # Optional ROI downsample for speed
+            use_ds = bool(self.cfg.use_roi_downsample) and (0.0 < float(self.cfg.roi_downsample_scale) < 1.0)
+            if use_ds:
+                s = float(self.cfg.roi_downsample_scale)
+                new_w = max(2, int(round(prev_roi.shape[1] * s)))
+                new_h = max(2, int(round(prev_roi.shape[0] * s)))
+                prev_roi_ds = cv2.resize(prev_roi, (new_w, new_h))
+                curr_roi_ds = cv2.resize(curr_roi, (new_w, new_h))
+                pts0_roi_ds = pts0_roi * s
+                next_pts_roi_ds, st, err = cv2.calcOpticalFlowPyrLK(
+                    prev_roi_ds, curr_roi_ds, pts0_roi_ds, None,
+                    winSize=self._lk_win, maxLevel=self._lk_levels,
+                    criteria=self._lk_term,
+                )
+                next_pts_roi = (next_pts_roi_ds / s) if next_pts_roi_ds is not None else None
+            else:
+                next_pts_roi, st, err = cv2.calcOpticalFlowPyrLK(
+                    prev_roi, curr_roi, pts0_roi, None,
+                    winSize=self._lk_win, maxLevel=self._lk_levels,
+                    criteria=self._lk_term,
+                )
             st = st.reshape(-1) if st is not None else None
             next_pts = (next_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2) if next_pts_roi is not None else None
             used_roi = True
@@ -375,8 +432,15 @@ class CourtLKTracker:
             disp = np.linalg.norm(p1 - p0, axis=1)
             md = float(np.median(disp)) if disp.size > 0 else 0.0
             # Map median displacement to target scale in [1.0, 1.8]
-            target = 1.0 + min(1.0, md / 12.0) * 0.8
+            target = 1.0 + min(1.0, md / float(max(1e-6, self.cfg.motion_md_ref_px))) * 0.8
             self._roi_scale = float(np.clip(0.7 * self._roi_scale + 0.3 * target, 1.0, 2.0))
+            # Adapt Kalman process noise from motion magnitude
+            if self.cfg.use_kalman and self.KF is not None and self.cfg.kalman_q_scale_from_motion:
+                qlo = float(self.cfg.kalman_q_scale_lo)
+                qhi = float(self.cfg.kalman_q_scale_hi)
+                q = min(1.0, max(0.0, md / float(max(1e-6, self.cfg.motion_md_ref_px))))
+                scale = qlo + (qhi - qlo) * q
+                self.KF.set_process_scale(scale)
         except Exception:
             pass
 
@@ -437,9 +501,45 @@ class CourtLKTracker:
             or (info["condH"] is not None and info["condH"] > 1e4)
             or (not s_ok)
         ):
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            return None, info
+            # Optionally try affine fallback when homography path fails
+            tried_fallback = False
+            if self.cfg.use_homography and self.cfg.model_fallback_affine_on_fail:
+                tried_fallback = True
+                try:
+                    M2, in2 = cv2.estimateAffinePartial2D(p0, curr_surv, method=cv2.RANSAC, ransacReprojThreshold=self.cfg.ransac_reproj_thresh)
+                    if M2 is not None and in2 is not None and int(in2.sum()) >= self.cfg.min_inliers:
+                        H_prev_curr = np.eye(3, dtype=np.float64)
+                        H_prev_curr[:2, :] = M2
+                        info["method"] = "affine(prev->curr) [fallback]"
+                        inlier_count = int(in2.sum())
+                        info["inliers"] = inlier_count
+                        info["inlier_ratio"] = float(inlier_count / max(1, len(p0)))
+                        # Re-evaluate simple scale gate
+                        try:
+                            basis0 = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+                            basis1 = cv2.perspectiveTransform(basis0.reshape(-1, 1, 2), H_prev_curr).reshape(-1, 2)
+                            sx = float(np.linalg.norm(basis1[1] - basis1[0]))
+                            sy = float(np.linalg.norm(basis1[2] - basis1[0]))
+                            lo = 1.0 - float(self.cfg.max_scale_change_per_frame)
+                            hi = 1.0 + float(self.cfg.max_scale_change_per_frame)
+                            s_ok = (lo <= sx <= hi) and (lo <= sy <= hi)
+                        except Exception:
+                            s_ok = True
+                        if s_ok:
+                            # proceed with fallback result; skip the hold-return path
+                            pass
+                        else:
+                            raise RuntimeError("fallback scale gate fail")
+                    else:
+                        raise RuntimeError("fallback inliers insufficient")
+                except Exception:
+                    info["hold"] = True
+                    self.hold_left = max(0, self.hold_left - 1)
+                    return None, info
+            else:
+                info["hold"] = True
+                self.hold_left = max(0, self.hold_left - 1)
+                return None, info
 
         # Accept: accumulate transform keyframe->current
         self.curr_H = H_prev_curr @ self.curr_H
@@ -449,15 +549,17 @@ class CourtLKTracker:
 
         # Apply to keyframe corners
         curr_corners = np.array(apply_homography_points(self.keyframe_corners.tolist(), self.curr_H), dtype=np.float32)
-        # Subpixel refine the 4 corners for better spatial stability
-        try:
-            win = (int(self.cfg.subpix_win), int(self.cfg.subpix_win))
-            corners_nx1x2 = curr_corners.reshape(-1, 1, 2).astype(np.float32)
-            corners_ref = cv2.cornerSubPix(gray, corners_nx1x2, win, (-1, -1), self._subpix_term)
-            if corners_ref is not None and len(corners_ref) == 4:
-                curr_corners = corners_ref.reshape(4, 2)
-        except Exception:
-            pass
+        # Subpixel refine the 4 corners for better spatial stability (throttled)
+        do_refine = (self._frame_tick % max(1, int(self.cfg.subpix_stride))) == 0
+        if do_refine:
+            try:
+                win = (int(self.cfg.subpix_win), int(self.cfg.subpix_win))
+                corners_nx1x2 = curr_corners.reshape(-1, 1, 2).astype(np.float32)
+                corners_ref = cv2.cornerSubPix(gray, corners_nx1x2, win, (-1, -1), self._subpix_term)
+                if corners_ref is not None and len(corners_ref) == 4:
+                    curr_corners = corners_ref.reshape(4, 2)
+            except Exception:
+                pass
 
         # Geometric sanity checks (ratio/area and jump vs smoothed)
         ratio, area = self._shape_metrics(curr_corners)
@@ -539,6 +641,7 @@ class CourtLKTracker:
         except Exception:
             pass
         out_pts = [(float(x), float(y)) for x, y in order_corners(self.ema_corners.tolist())]
+        self._frame_tick = (self._frame_tick + 1) % 1000000
         return out_pts, info
 
 

@@ -8,7 +8,12 @@ import cv2
 from core.utils import ensure_dir
 from core.config import settings
 from core.roboflow_client import RoboflowClient
-from court.utils import corners_from_prediction
+from court.utils import (
+    corners_from_prediction,
+    compute_homography,
+    build_court_model_template,
+    template_precision_score,
+)
 
 
 def choose_best_pred(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -24,6 +29,10 @@ def capture_court(
     cache_dir: str,
     combined_jsonl: str,
     save_jpegs: bool,
+    use_template_score: bool,
+    template_min_precision: float,
+    template_line_px: int,
+    gate_by_template: bool,
 ) -> None:
     """Captures court detections from a video at a low frame rate."""
     ensure_dir(cache_dir)
@@ -70,6 +79,28 @@ def capture_court(
             best = choose_best_pred(result)
             corners = corners_from_prediction(best) if best else None
 
+            tpl_prec: Optional[float] = None
+            tpl_pass: Optional[bool] = None
+            if use_template_score and corners:
+                try:
+                    # Compute homography image->model and build a template
+                    H_img2model, model_size = compute_homography(corners)
+                    Wm, Hm = model_size
+                    template_mask = build_court_model_template(Wm, Hm, line_px=int(template_line_px), orientation="horizontal")
+                    # Score using model->image
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    H_model2img = None
+                    try:
+                        import numpy as np
+                        H_model2img = np.linalg.inv(H_img2model)
+                    except Exception:
+                        H_model2img = None
+                    if H_model2img is not None:
+                        tpl_prec = float(template_precision_score(gray, H_model2img, template_mask))
+                        tpl_pass = tpl_prec >= float(template_min_precision)
+                except Exception:
+                    tpl_prec, tpl_pass = None, None
+
             rec = {
                 "frame": next_idx,
                 "time_sec": next_idx / fps if fps else None,
@@ -80,6 +111,15 @@ def capture_court(
                 "raw_json": os.path.relpath(raw_json_path),
                 "cached_jpeg": os.path.relpath(img_path) if save_jpegs else None,
             }
+            if tpl_prec is not None:
+                rec["tpl_prec"] = tpl_prec
+            if tpl_pass is not None:
+                rec["tpl_pass"] = tpl_pass
+
+            if gate_by_template and use_template_score and (tpl_pass is False):
+                # Skip writing this detection when gated out
+                continue
+
             out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     cap.release()
@@ -92,6 +132,12 @@ def main():
     parser.add_argument("--model-id", default=os.getenv("COURT_MODEL_ID", "volleyball-court-lurkn/1"))
     parser.add_argument("--confidence", type=float, default=settings.OVERLAY_MIN_CONF)
     parser.add_argument("--interval-sec", type=float, default=float(os.getenv("COURT_INTERVAL_SEC", 5.0)))
+    # Template precision scoring/gating
+    parser.add_argument("--use-template-score", dest="use_template_score", action="store_true", default=None, help="Compute template precision score for each detection")
+    parser.add_argument("--no-template-score", dest="use_template_score", action="store_false", help="Disable template precision scoring")
+    parser.add_argument("--template-min-precision", type=float, default=None, help="Minimum template precision to accept detection when gating")
+    parser.add_argument("--template-line-px", type=int, default=None, help="Template line thickness in pixels")
+    parser.add_argument("--gate-by-template", action="store_true", help="Drop detections that fail template precision threshold")
     args = parser.parse_args()
 
     capture_court(
@@ -101,6 +147,10 @@ def main():
         cache_dir=os.getenv("COURT_CACHE_DIR", "outputs/court_preds"),
         combined_jsonl=settings.COURT_DETECTIONS_JSONL,
         save_jpegs=settings.COURT_SAVE_JPEGS,
+        use_template_score=(settings.COURT_DET_USE_TEMPLATE_SCORE if args.use_template_score is None else bool(args.use_template_score)),
+        template_min_precision=(settings.COURT_DET_MIN_TEMPLATE_PREC if args.template_min_precision is None else float(args.template_min_precision)),
+        template_line_px=(settings.COURT_DET_TEMPLATE_LINE_PX if args.template_line_px is None else int(args.template_line_px)),
+        gate_by_template=bool(args.gate_by_template),
     )
 
 

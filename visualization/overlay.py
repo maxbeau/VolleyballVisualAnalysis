@@ -5,12 +5,13 @@ import cv2
 import math
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
-from court.utils import standard_court_model_size, build_court_model_template, template_precision_score
+from court.utils import standard_court_model_size
+from visualization.mini_birdseye import MiniBirdseyeOverlay
+from court.orientation import decide_orientation as decide_court_orientation
 from core.config import settings
 from core.utils import ensure_dir
 from analysis.smoothing import kalman_rts_smooth
 from analysis.kinematic_filter import filter_by_kinematics
-from ball.pipeline import build_ball_tracks, parse_frame_spec
 from ball.pipeline import build_ball_tracks, parse_frame_spec
 
 
@@ -347,20 +348,53 @@ def main():
                     court_corners = [(float(x), float(y)) for x, y in cdata["median"]]
             except Exception:
                 court_corners = None
-    # Precompute canonical court model size and line template
+    # Precompute canonical court model size and build court renderer
     Wm, Hm = standard_court_model_size(scale_px_per_meter=100.0)
-    model_tpl = build_court_model_template(Wm, Hm, max(1, court_thickness), orientation="vertical")
+    from visualization.court_overlay import CourtOverlay
+    court_renderer = CourtOverlay(
+        border_color=court_color,
+        thickness=court_thickness,
+        model_size=(Wm, Hm),
+        tpl_line_px=max(1, court_thickness),
+        center_color=court_center_color,
+        attack_color=court_attack_color,
+        diag=settings.COURT_SHOW_DIAG,
+    )
 
-    # Orientation temporal smoothing + hysteresis
-    last_rot = 0  # 0,1,2,3 => 0,90,180,270 deg
-    score_ema = np.zeros(4, dtype=np.float32)
-    ema_inited = False
-    ema_alpha = 0.3  # 0<alpha<=1; higher reacts faster
-    improve_eps = 0.05  # require >5% improvement on smoothed score to switch
-    switch_patience = 3  # need N consecutive wins to flip
-    consecutive_wins = 0
-    lock_frames = 10  # after switch, lock orientation for N frames
-    lock_left = 0
+    # Mini bird's-eye overlay preparation (top-right), using orientation meta or decision
+    mini_enable = bool(getattr(settings, "COURT_MINI_ENABLE", True))
+    mini_orient = None
+    if mini_enable:
+        try:
+            with open(getattr(settings, "COURT_TRACKING_META", ""), "r", encoding="utf-8") as mf:
+                meta = json.load(mf)
+                mini_orient = str(meta.get("orientation")) if isinstance(meta, dict) else None
+        except Exception:
+            mini_orient = None
+        if mini_orient not in ("horizontal", "vertical"):
+            # Build light ts dict from early timeseries (if available)
+            ts_for_orient = {}
+            if isinstance(court_timeseries_early, dict):
+                for fi, cs in court_timeseries_early.items():
+                    if len(cs) >= 4:
+                        ts_for_orient[int(fi)] = {"corners": [(float(cs[0][0]), float(cs[0][1])),
+                                                               (float(cs[1][0]), float(cs[1][1])),
+                                                               (float(cs[2][0]), float(cs[2][1])),
+                                                               (float(cs[3][0]), float(cs[3][1]))]}
+            mini_orient = decide_court_orientation(cap, ts_for_orient, (Wm, Hm), mode=getattr(settings, "COURT_MINI_ORIENT_MODE", "template"))
+        tpl_colors = {"border": court_color, "center": court_center_color, "attack": court_attack_color}
+        mini = MiniBirdseyeOverlay(
+            colors=tpl_colors,
+            thickness=court_thickness,
+            placement=getattr(settings, "COURT_MINI_PLACEMENT", "top-right"),
+            scale=getattr(settings, "COURT_MINI_SCALE", 0.24),
+            margin=12,
+            show_label=getattr(settings, "COURT_MINI_SHOW_LABEL", True),
+            draw_poly=getattr(settings, "COURT_MINI_DRAW_POLY", True),
+        )
+        mini_label = mini_orient
+
+    # Court renderer maintains its own internal smoothing/hysteresis
 
     i = 0
     last_court_pts: Optional[List[Tuple[float, float]]] = None
@@ -505,111 +539,14 @@ def main():
         elif court_corners is not None and len(court_corners) == 4:
             pts = court_corners
         if pts is not None and len(pts) == 4:
-            # Orientation-aware model->image homography selection by template precision
-            dst = np.array([[pts[0][0], pts[0][1]], [pts[1][0], pts[1][1]], [pts[2][0], pts[2][1]], [pts[3][0], pts[3][1]]], dtype=np.float32)
-            src0 = np.array([[0.0, 0.0], [Wm - 1.0, 0.0], [Wm - 1.0, Hm - 1.0], [0.0, Hm - 1.0]], dtype=np.float32)
-            # 90/180/270 deg rotations of the model corners
-            src90 = np.array([[0.0, Hm - 1.0], [0.0, 0.0], [Wm - 1.0, 0.0], [Wm - 1.0, Hm - 1.0]], dtype=np.float32)
-            src180 = np.array([[Wm - 1.0, Hm - 1.0], [0.0, Hm - 1.0], [0.0, 0.0], [Wm - 1.0, 0.0]], dtype=np.float32)
-            src270 = np.array([[Wm - 1.0, 0.0], [Wm - 1.0, Hm - 1.0], [0.0, Hm - 1.0], [0.0, 0.0]], dtype=np.float32)
+            frame = court_renderer.draw(frame, pts, last_court_info)
 
-            gr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gr, 50, 150)
-            edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-
-            def score_for(src: np.ndarray) -> Tuple[float, np.ndarray]:
-                Hmi = cv2.getPerspectiveTransform(src, dst)
-                prec = template_precision_score(gr, Hmi, model_tpl)
-                return prec, Hmi
-
-            candidates = [src0, src90, src180, src270]
-            cand_scores: List[Tuple[float, int, np.ndarray]] = []
-            for k, s in enumerate(candidates):
-                sc, Hmi = score_for(s)
-                cand_scores.append((sc, k, Hmi))
-            # Update EMA of scores per orientation
-            raw_scores = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-            Hcands = {}
-            for sc, k, Hmi in cand_scores:
-                raw_scores[k] = float(sc)
-                Hcands[k] = Hmi
-            if not ema_inited:
-                # First frame: directly choose the best orientation (no hysteresis)
-                score_ema = raw_scores.copy()
-                ema_inited = True
-                last_rot = int(np.argmax(score_ema))
-                rot = last_rot
-                H = Hcands[rot]
-                consecutive_wins = 0
-                lock_left = 0
-            else:
-                # Smooth scores over time
-                score_ema = (1.0 - ema_alpha) * score_ema + ema_alpha * raw_scores
-                best_rot = int(np.argmax(score_ema))
-
-                # Orientation locking to prevent rapid flips
-                if lock_left > 0:
-                    rot = last_rot
-                    H = Hcands.get(rot, Hcands.get(best_rot))
-                    lock_left -= 1
-                else:
-                    # Check if best rot truly better than current with margin
-                    curr = float(score_ema[last_rot])
-                    cand = float(score_ema[best_rot])
-                    if best_rot != last_rot and cand > curr * (1.0 + improve_eps):
-                        consecutive_wins += 1
-                        if consecutive_wins >= switch_patience:
-                            rot = best_rot
-                            H = Hcands[rot]
-                            last_rot = rot
-                            consecutive_wins = 0
-                            lock_left = lock_frames
-                        else:
-                            rot = last_rot
-                            H = Hcands[rot]
-                    else:
-                        consecutive_wins = 0
-                        rot = last_rot
-                        H = Hcands[rot]
-
-            # Draw outer border
-            pairs = [(0, 1), (1, 2), (2, 3), (3, 0)]
-            for a, b in pairs:
-                ax, ay = int(round(pts[a][0])), int(round(pts[a][1]))
-                bx, by = int(round(pts[b][0])), int(round(pts[b][1]))
-                cv2.line(frame, (ax, ay), (bx, by), court_color, court_thickness)
-
-            # Render center/attack lines using chosen H (model->image)
-            def proj_vline(x_model: float) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-                P = np.array([[x_model, 0.0], [x_model, Hm - 1.0]], dtype=np.float32).reshape(-1, 1, 2)
-                Q = cv2.perspectiveTransform(P, H).reshape(-1, 2)
-                return (int(round(Q[0, 0])), int(round(Q[0, 1]))), (int(round(Q[1, 0])), int(round(Q[1, 1])))
-
-            x_center = (Wm - 1.0) * 0.5
-            c0, c1 = proj_vline(x_center)
-            cv2.line(frame, c0, c1, court_center_color, max(1, court_thickness))
-            x_a1 = (Wm - 1.0) * (6.0 / 18.0)
-            x_a2 = (Wm - 1.0) * (12.0 / 18.0)
-            a10, a11 = proj_vline(x_a1)
-            a20, a21 = proj_vline(x_a2)
-            cv2.line(frame, a10, a11, court_attack_color, max(1, court_thickness))
-            cv2.line(frame, a20, a21, court_attack_color, max(1, court_thickness))
-
-            # Optional diagnostics
-            if settings.COURT_SHOW_DIAG and last_court_info is not None:
-                txt = []
-                def add(k):
-                    v = last_court_info.get(k)
-                    if v is not None:
-                        try:
-                            txt.append(f"{k}:{float(v):.3f}")
-                        except Exception:
-                            txt.append(f"{k}:{v}")
-                for k in ("inlier_ratio","med_reproj_err","condH","scale_x","scale_y","tpl_prec","roi_scale","matches","inliers"):
-                    add(k)
-                if txt:
-                    s = "  ".join(txt)
-                    cv2.putText(frame, s, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+        # Draw mini bird's-eye if enabled
+        if mini_enable:
+            try:
+                mini.render(frame, mini_label or "horizontal", pts, (Wm, Hm))
+            except Exception:
+                pass
 
         if resize_needed:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
