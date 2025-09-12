@@ -10,6 +10,8 @@ from court.utils import (
     compute_homography,
     build_court_model_template,
     template_precision_score,
+    shape_metrics as _shape_metrics_util,
+    within_tol as _within_tol_util,
 )
 
 
@@ -198,24 +200,13 @@ class CourtLKTracker:
 
     @staticmethod
     def _shape_metrics(corners: np.ndarray) -> Tuple[float, float]:
-        c = corners.reshape(4, 2).astype(np.float64)
-        tl, tr, br, bl = c
-        top = np.linalg.norm(tr - tl)
-        bottom = np.linalg.norm(br - bl)
-        left = np.linalg.norm(bl - tl)
-        right = np.linalg.norm(br - tr)
-        w = max(1e-6, 0.5 * (top + bottom))
-        h = max(1e-6, 0.5 * (left + right))
-        ratio = float(w / h)
-        x = c[:, 0]; y = c[:, 1]
-        area = 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-        return ratio, area
+        # Delegate to shared utility for consistency
+        return _shape_metrics_util(corners)
 
     @staticmethod
     def _within_tol(val: float, ref: float, tol: float) -> bool:
-        if ref == 0:
-            return False
-        return (ref * (1 - tol)) <= val <= (ref * (1 + tol))
+        # Delegate to shared utility for consistency
+        return _within_tol_util(val, ref, tol)
 
     def _build_model_template(self, model_size: Tuple[int, int], line_px: int) -> np.ndarray:
         W, H = model_size

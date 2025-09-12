@@ -85,6 +85,37 @@ python3 scripts/run_overlay.py
 - 支持“长宽比软权重”“运动学过滤（可选）”与“重力外推”提升遮挡段的外推质量。
 - 输出 `outputs/ball_overlay_full.mp4`。
 
+3) 球场追踪（LK+RANSAC + 模板评分 + Kalman，可调 CLI）
+```bash
+python3 -m court.processing \
+  --detections-jsonl outputs/court_detections.jsonl \
+  --tracking-jsonl outputs/court_tracking.jsonl \
+  --use-homography \
+  --ransac-thresh 3.0 \
+  --hold-ttl 8 \
+  --min-inlier-ratio 0.35 --min-inliers 20 \
+  --fb-reproj-thresh 1.2 --max-scale-change-per-frame 0.08 \
+  --feature-max 200 --roi-expand-ratio 0.06 --lk-roi-expand-ratio 0.12 \
+  --reseed-min-tracks 40 --subpix-win 5 \
+  --max-jump-px 8.0 --ratio-tolerance 0.3 --area-tolerance 0.5 \
+  --use-template-score --template-line-px 8 --template-min-precision 0.28 \
+  --use-kalman --kalman-q-pos 1e-2 --kalman-q-vel 5e-2 --kalman-r-meas 2.0 \
+  --kf-adaptive-from-template --kf-r-api-min 0.8 --kf-r-api-max 2.5
+```
+说明：
+- 输入 `--detections-jsonl` 为低频角点关键帧（模型预测/人工修正均可）。
+- 输出逐帧角点到 `--tracking-jsonl`，后续用于稳健单应性估计与鸟瞰图。
+- 未提供的参数默认沿用 `court/config.py` 的数据类默认值与 `core/config.py` 的项目级调参。
+
+关键参数分组：
+- 模型选择：`--use-homography` 或 `--affine`
+- RANSAC 与失败回退：`--ransac-thresh`，`--hold-ttl`，`--min-inlier-ratio`，`--min-inliers`
+- LK 鲁棒：`--fb-reproj-thresh`，`--max-scale-change-per-frame`
+- 特征与 ROI：`--feature-max`，`--roi-expand-ratio`，`--lk-roi-expand-ratio`，`--reseed-min-tracks`，`--subpix-win`
+- 几何门限：`--max-jump-px`，`--ratio-tolerance`，`--area-tolerance`
+- 模板评分：`--use-template-score/--no-template-score`，`--template-line-px`，`--template-min-precision`
+- Kalman：`--use-kalman/--no-kalman`，`--kalman-q-pos`，`--kalman-q-vel`，`--kalman-r-meas`，`--kf-adaptive-from-template`，`--kf-r-api-min`，`--kf-r-api-max`
+
 ### 运动学过滤（可选）
 启用后，将在平滑前按图像空间速度/加速度/转向/尺寸变化做硬门控，排除明显不可能为排球的帧。
 
@@ -128,12 +159,12 @@ python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detecti
 - `ball/pipeline.py`：Ball 轨迹管线（加载候选 → Viterbi 全局路径 → 可选连续性贪心/确认/回溯）
 - `visualization/overlay.py`：叠加渲染（Viterbi 轨迹、Kalman 可选、软权重、可选场地）
 - `analysis/smoothing.py`：Kalman + RTS 平滑、观测门控与重力注入
-- `court/utils.py`：球场几何工具（角点解析与排序）
+- `court/utils.py`：球场几何工具（角点解析与排序），共用度量 `shape_metrics`、`within_tol`
 - `court/detect.py`：仅采集球场检测结果（抽样帧 JPEG+原始 JSON、合并 JSONL）
 - `court/config.py`：Court 跟踪/门控/模板评分/Kalman 等参数集中管理
 - `court/tracker.py`：LK+RANSAC 单应 + 模板评分 + 几何门控 + Kalman 平滑
 - `court/io.py`：关键帧 JSONL 加载与稳健去极值
-- `court/processing.py`：编排器（读取关键帧→跟踪→写 `court_tracking.jsonl`）
+- `court/processing.py`：编排器与 CLI（读取关键帧→LK+RANSAC+Kalman→输出 `court_tracking.jsonl`）
 - `court/smoothing.py`：2D 常速度 Kalman（世界坐标轻量去噪，用于轨迹）
 - `core/roboflow_client.py`：Roboflow SDK 轻封装与网络设置
 - `core/utils.py`：读取 `.env`、保证目录存在、选择视频路径

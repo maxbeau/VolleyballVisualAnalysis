@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 
 def _np():
@@ -70,6 +70,35 @@ def corners_from_prediction(pred: Dict) -> Optional[List[Tuple[float, float]]]:
         return order_corners(corners)
     corners = rect_from_bbox(pred)
     return order_corners(corners)
+
+
+def shape_metrics(corners: Union[List[Tuple[float, float]], "np.ndarray"]) -> Tuple[float, float]:
+    """
+    Compute (aspect_ratio approx, polygon area) for 4 corners in TL,TR,BR,BL order.
+    - aspect_ratio ~ average(top,bottom)/average(left,right)
+    Returns: (ratio, area)
+    """
+    import numpy as np
+    c = np.array(corners, dtype=np.float64).reshape(4, 2)
+    tl, tr, br, bl = c
+    top = np.linalg.norm(tr - tl)
+    bottom = np.linalg.norm(br - bl)
+    left = np.linalg.norm(bl - tl)
+    right = np.linalg.norm(br - tr)
+    w = max(1e-6, 0.5 * (top + bottom))
+    h = max(1e-6, 0.5 * (left + right))
+    ratio = float(w / h)
+    x = c[:, 0]
+    y = c[:, 1]
+    area = 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+    return ratio, area
+
+
+def within_tol(val: float, ref: float, tol: float) -> bool:
+    """Return True if val is within [ref*(1-tol), ref*(1+tol)]."""
+    if ref == 0:
+        return False
+    return (ref * (1 - tol)) <= val <= (ref * (1 + tol))
 
 
 def standard_court_model_size(scale_px_per_meter: float = 100.0) -> Tuple[int, int]:
@@ -182,6 +211,8 @@ __all__ = [
     "rect_from_bbox",
     "order_corners",
     "corners_from_prediction",
+    "shape_metrics",
+    "within_tol",
     "standard_court_model_size",
     "standard_court_dst_corners",
     "compute_homography",
