@@ -24,6 +24,25 @@ class Settings:
         self.PLAYERS_CACHE_DIR: str = os.getenv("PLAYERS_CACHE_DIR", "outputs/players_preds")
         self.PLAYERS_SAVE_FRAME_JSON: bool = os.getenv("PLAYERS_SAVE_FRAME_JSON", "true").lower() == "true"
         self.PLAYERS_INFER_FPS: int = int(os.getenv("PLAYERS_INFER_FPS", "6"))
+        # Players Tracking
+        self.PLAYERS_TRACKS_JSONL: str = os.getenv("PLAYERS_TRACKS_JSONL", "outputs/players_tracks.jsonl")
+        self.PLAYERS_TRACK_THRESH: float = float(os.getenv("PLAYERS_TRACK_THRESH", "0.35"))
+        self.PLAYERS_MATCH_IOU: float = float(os.getenv("PLAYERS_MATCH_IOU", "0.3"))
+        self.PLAYERS_LOW_TRACK_THRESH: float = float(os.getenv("PLAYERS_LOW_TRACK_THRESH", "0.1"))
+        self.PLAYERS_REID_WEIGHT: float = float(os.getenv("PLAYERS_REID_WEIGHT", "0.55"))
+        self.PLAYERS_MAX_AGE: int = int(os.getenv("PLAYERS_MAX_AGE", "30"))
+        self.PLAYERS_MIN_HITS: int = int(os.getenv("PLAYERS_MIN_HITS", "3"))
+        # Players ReID backend
+        self.PLAYERS_REID_BACKEND: str = os.getenv("PLAYERS_REID_BACKEND", "onnx")  # onnx | hist
+        self.PLAYERS_REID_ONNX: str = os.getenv("PLAYERS_REID_ONNX", "weights/osnet_x0_25_msmt17.onnx")
+        self.PLAYERS_REID_AUTO_DOWNLOAD: bool = os.getenv("PLAYERS_REID_AUTO_DOWNLOAD", "true").lower() == "true"
+        # Players OCR
+        self.PLAYERS_OCR_ENABLE: bool = os.getenv("PLAYERS_OCR_ENABLE", "true").lower() == "true"
+        self.PLAYERS_OCR_MIN_CONF: float = float(os.getenv("PLAYERS_OCR_MIN_CONF", "0.5"))
+        # Players overlay fill/hold
+        self.PLAYERS_INTERP_ENABLE: bool = os.getenv("PLAYERS_INTERP_ENABLE", "true").lower() == "true"
+        self.PLAYERS_INTERP_MAX_GAP: int = int(os.getenv("PLAYERS_INTERP_MAX_GAP", "6"))
+        self.PLAYERS_HOLD_TTL_FRAMES: int = int(os.getenv("PLAYERS_HOLD_TTL_FRAMES", "8"))
 
         # Ball Detection
         self.BALL_DETECTIONS_JSONL: str = os.getenv("BALL_DETECTIONS_JSONL", "outputs/ball_detections.jsonl")
@@ -48,7 +67,7 @@ class Settings:
         self.COURT_SHOW_DIAG: bool = os.getenv("COURT_SHOW_DIAG", "false").lower() == "true"
 
         # Overlay Output
-        self.BALL_OVERLAY_FULL: str = os.getenv("BALL_OVERLAY_FULL", "outputs/ball_overlay_full.mp4")
+        self.BALL_OVERLAY_FULL: str = os.getenv("BALL_OVERLAY_FULL", "outputs/final_overlay.mp4")
         self.PLAYERS_OVERLAY_FULL: str = os.getenv("PLAYERS_OVERLAY_FULL", "outputs/players_overlay.mp4")
         self.OVERLAY_MIN_CONF: float = float(os.getenv("OVERLAY_MIN_CONF", "0.1"))
         self.SHOW_BOX_LABELS: bool = os.getenv("SHOW_BOX_LABELS", "false").lower() == "true"

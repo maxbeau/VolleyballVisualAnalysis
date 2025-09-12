@@ -100,6 +100,9 @@ def main():
     court_thickness = settings.COURT_THICKNESS
     court_center_color = settings.COURT_CENTER_COLOR
     court_attack_color = settings.COURT_ATTACK_COLOR
+    # Players overlay (tracks with IDs/jersey)
+    players_tracks_jsonl = getattr(settings, "PLAYERS_TRACKS_JSONL", os.path.join("outputs", "players_tracks.jsonl"))
+    players_enable = os.path.exists(players_tracks_jsonl)
 
     ball_available = os.path.exists(jsonl_path)
     if not ball_available:
@@ -189,6 +192,27 @@ def main():
     if softened > 0:
         print(f"AR soft-weight: adjusted {softened} frames by aspect-ratio; total {len(adjusted)}")
     best = adjusted
+
+    # Load players tracks (if available)
+    players_ts: Optional[Dict[int, List[Dict[str, Any]]]] = None
+    if players_enable:
+        players_ts = {}
+        try:
+            with open(players_tracks_jsonl, "r", encoding="utf-8") as pf:
+                for line in pf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    fi = int(rec.get("frame", -1))
+                    trs = rec.get("tracks")
+                    if fi >= 0 and isinstance(trs, list):
+                        players_ts[fi] = trs
+        except Exception:
+            players_ts = None
 
     # Manual exclude list from env (e.g., "20-33,244,252")
     frames_excluded_list = set(parse_frame_spec(settings.BALL_EXCLUDE_FRAMES))
@@ -550,6 +574,35 @@ def main():
 
         if resize_needed:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+        # Draw players overlay (IDs and optional jersey)
+        if players_ts is not None:
+            try:
+                trs = players_ts.get(i)
+                if trs:
+                    p_color = (0, 165, 255)
+                    for t in trs:
+                        try:
+                            conf_p = float(t.get("confidence", 0.0))
+                        except Exception:
+                            conf_p = 0.0
+                        if conf_p < min_conf:
+                            continue
+                        x = float(t.get("x", 0.0))
+                        y = float(t.get("y", 0.0))
+                        w = float(t.get("width", 0.0))
+                        h = float(t.get("height", 0.0))
+                        x1, y1, x2, y2 = to_tlbr_from_xywh(x, y, w, h)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), p_color, 2)
+                        label = f"P{t.get('id','')}"
+                        jersey = t.get("jersey")
+                        if jersey:
+                            label += f" #{jersey}"
+                        if show_labels:
+                            label = f"{label} {conf_p:.2f}"
+                        cv2.putText(frame, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, p_color, 2, cv2.LINE_AA)
+            except Exception:
+                pass
         # Update evaluation stats (kept vs. not kept)
         if eval_enable and ball_available and (i in eval_domain):
             kept_now = (i in frames_kept) if not smoothing_enable else (i in smoothed)
