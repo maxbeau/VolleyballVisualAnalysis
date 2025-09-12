@@ -19,6 +19,12 @@ class Settings:
         self.INFER_FPS: int = int(os.getenv("INFER_FPS", "12"))
         self.CACHE_DIR: str = os.getenv("CACHE_DIR", "outputs/preds")
         
+        # Players Detection
+        self.PLAYERS_DETECTIONS_JSONL: str = os.getenv("PLAYERS_DETECTIONS_JSONL", "outputs/players_detections.jsonl")
+        self.PLAYERS_CACHE_DIR: str = os.getenv("PLAYERS_CACHE_DIR", "outputs/players_preds")
+        self.PLAYERS_SAVE_FRAME_JSON: bool = os.getenv("PLAYERS_SAVE_FRAME_JSON", "true").lower() == "true"
+        self.PLAYERS_INFER_FPS: int = int(os.getenv("PLAYERS_INFER_FPS", "6"))
+
         # Ball Detection
         self.BALL_DETECTIONS_JSONL: str = os.getenv("BALL_DETECTIONS_JSONL", "outputs/ball_detections.jsonl")
         self.BALL_SAVE_FRAME_JSON: bool = os.getenv("BALL_SAVE_FRAME_JSON", "false").lower() == "true"
@@ -43,6 +49,7 @@ class Settings:
 
         # Overlay Output
         self.BALL_OVERLAY_FULL: str = os.getenv("BALL_OVERLAY_FULL", "outputs/ball_overlay_full.mp4")
+        self.PLAYERS_OVERLAY_FULL: str = os.getenv("PLAYERS_OVERLAY_FULL", "outputs/players_overlay.mp4")
         self.OVERLAY_MIN_CONF: float = float(os.getenv("OVERLAY_MIN_CONF", "0.1"))
         self.SHOW_BOX_LABELS: bool = os.getenv("SHOW_BOX_LABELS", "false").lower() == "true"
         self.OVERLAY_CODEC: str = os.getenv("OVERLAY_CODEC", "avc1")
