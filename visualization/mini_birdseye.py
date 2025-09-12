@@ -91,6 +91,8 @@ class MiniBirdseyeOverlay:
         orientation: str,
         corners: Optional[List[Tuple[float, float]]] = None,
         model_size: Tuple[int, int] = (1800, 900),
+        players_xy: Optional[List[Tuple[float, float]]] = None,
+        players_color: Tuple[int, int, int] = (0, 165, 255),
     ) -> None:
         Hf, Wf = frame.shape[:2]
         x1, y1, x2, y2 = self._compute_rect(Wf, Hf, orientation)
@@ -109,10 +111,25 @@ class MiniBirdseyeOverlay:
                     sx = int(round(mx * (ov_w - 1) / max(1, (Wm - 1))))
                     sy = int(round(my * (ov_h - 1) / max(1, (Hm - 1))))
                     poly.append((x1 + sx, y1 + sy))
+                line_color = self.colors.get("border", (0, 255, 0))
                 for k in range(4):
                     p1 = poly[k]
                     p2 = poly[(k + 1) % 4]
-                    cv2.line(frame, p1, p2, (0, 200, 255), max(1, int(round(self.thickness * 0.9))))
+                    cv2.line(frame, p1, p2, line_color, max(1, int(round(self.thickness * 0.9))))
+            except Exception:
+                pass
+        # Draw players (projected to bird's-eye) if provided and corners available
+        if players_xy and corners and len(corners) >= 4:
+            try:
+                H_img2model, _ = compute_homography(corners, dst_size=model_size)
+                pts_model = apply_homography_points(players_xy, H_img2model)
+                Wm, Hm = model_size
+                for (mx, my) in pts_model:
+                    sx = int(round(mx * (ov_w - 1) / max(1, (Wm - 1))))
+                    sy = int(round(my * (ov_h - 1) / max(1, (Hm - 1))))
+                    cx = x1 + sx
+                    cy = y1 + sy
+                    cv2.circle(frame, (cx, cy), max(2, int(round(self.thickness * 1.2))), players_color, -1, lineType=cv2.LINE_AA)
             except Exception:
                 pass
         # Label

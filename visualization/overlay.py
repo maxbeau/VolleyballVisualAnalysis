@@ -565,10 +565,28 @@ def main():
         if pts is not None and len(pts) == 4:
             frame = court_renderer.draw(frame, pts, last_court_info)
 
-        # Draw mini bird's-eye if enabled
+        # Draw mini bird's-eye if enabled (with projected players if available)
         if mini_enable:
             try:
-                mini.render(frame, mini_label or "horizontal", pts, (Wm, Hm))
+                players_xy = None
+                if players_ts is not None:
+                    trs_now = players_ts.get(i)
+                    if trs_now:
+                        # Collect bottom-center points with confidence gate
+                        players_xy = []
+                        for t in trs_now:
+                            try:
+                                conf_p = float(t.get("confidence", 0.0))
+                            except Exception:
+                                conf_p = 0.0
+                            if conf_p < min_conf:
+                                continue
+                            cx = float(t.get("x", 0.0))
+                            cy = float(t.get("y", 0.0))
+                            h = float(t.get("height", 0.0))
+                            by = cy + (h * 0.5)
+                            players_xy.append((cx, by))
+                mini.render(frame, mini_label or "horizontal", pts, (Wm, Hm), players_xy=players_xy)
             except Exception:
                 pass
 
