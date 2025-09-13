@@ -74,7 +74,7 @@ class TrackerConfig:
     hist_bins_h: int = 16
     hist_bins_s: int = 8
     hist_bins_v: int = 4
-    # Advanced gating (Kalman removed; keep simple gates)
+    # Advanced gating (keep simple gates)
     reid_min_sim: float = 0.25
     size_change_max_ratio: float = 2.0  # allow up to 2x size change between frames
     # Anti-switch guard
@@ -85,10 +85,13 @@ class TrackerConfig:
     ocr_min_conf: float = 0.5
     ocr_upper_frac: float = 0.6
     jersey_min_track_conf: float = 0.6
+    # OCR dynamic bonus
+    ocr_bonus_max: float = 0.35
+    # Kalman removed for players tracking
 
 
 class Track:
-    def __init__(self, tid: int, tlbr: Tuple[int, int, int, int], conf: float, emb: Optional[np.ndarray], frame_idx: int):
+    def __init__(self, tid: int, tlbr: Tuple[int, int, int, int], conf: float, emb: Optional[np.ndarray], frame_idx: int, cfg: Optional[TrackerConfig] = None):
         self.id = tid
         self.tlbr = tlbr
         self.conf = conf
@@ -100,6 +103,7 @@ class Track:
         self.hits = 1
         self.last_frame = frame_idx
         self.active = True
+        self._cfg = cfg or TrackerConfig()
         # Size (EMA)
         x1, y1, x2, y2 = tlbr
         w = max(1.0, float(x2 - x1))
@@ -109,8 +113,10 @@ class Track:
         # Jersey number state
         self.jersey: Optional[str] = None
         self.jersey_conf: float = 0.0
+        self._jersey_buf: deque = deque([], maxlen=10)
+        # No Kalman state for players
 
-    def update(self, tlbr: Tuple[int, int, int, int], conf: float, emb: Optional[np.ndarray], frame_idx: int):
+    def update(self, tlbr: Tuple[int, int, int, int], conf: float, emb: Optional[np.ndarray], frame_idx: int, jersey_obs: Optional[Tuple[Optional[str], float]] = None):
         self.tlbr = tlbr
         self.conf = conf
         # Update size EMA
@@ -119,6 +125,7 @@ class Track:
         h = max(1.0, float(y2 - y1))
         self.size_w = 0.8 * self.size_w + 0.2 * w if hasattr(self, 'size_w') else w
         self.size_h = 0.8 * self.size_h + 0.2 * h if hasattr(self, 'size_h') else h
+        # No Kalman measurement update
         if emb is not None:
             # EMA to stabilize appearance
             if self.emb is None:
@@ -128,6 +135,28 @@ class Track:
                 n = np.linalg.norm(self.emb) + 1e-6
                 self.emb = self.emb / n
             self.embeds.append(emb)
+        # Jersey smoothing buffer
+        if jersey_obs is not None:
+            jtxt, jconf = jersey_obs
+            if jtxt and jconf >= self._cfg.ocr_min_conf:
+                self._jersey_buf.append((str(jtxt), float(jconf)))
+                # vote winner
+                counts: Dict[str, List[float]] = {}
+                for ttxt, c in self._jersey_buf:
+                    counts.setdefault(ttxt, []).append(c)
+                best_txt = None
+                best_score = -1.0
+                for k, vs in counts.items():
+                    score = len(vs) + 0.1 * sum(vs)
+                    if score > best_score:
+                        best_score = score
+                        best_txt = k
+                if best_txt is not None:
+                    conf_avg = float(sum(counts[best_txt]) / len(counts[best_txt]))
+                    # lock-in when seen >=3 times with decent conf
+                    if len(counts[best_txt]) >= 3 and conf_avg >= max(self._cfg.ocr_min_conf, 0.55):
+                        self.jersey = best_txt
+                        self.jersey_conf = conf_avg
         self.age = 0
         self.hits += 1
         self.last_frame = frame_idx
@@ -151,6 +180,7 @@ class ByteTrackReID:
         self.jersey_ocr = jersey_ocr
 
     def _score(self, track: Track, det_tlbr: Tuple[int, int, int, int], det_emb: Optional[np.ndarray]) -> float:
+        # use predicted state (track.tlbr is kept in sync with prediction)
         iou = iou_tlbr(track.tlbr, det_tlbr)
         sim = 0.0
         if det_emb is not None:
@@ -161,6 +191,32 @@ class ByteTrackReID:
                 sim = cos_sim(track.emb, det_emb)
         w = self.cfg.reid_weight
         return (1.0 - w) * iou + w * max(0.0, sim)
+
+    def _ocr_bonus(self, track: Track, jtxt: Optional[str], jconf: float) -> float:
+        """Dynamic OCR bonus based on confidence of detection and track jersey.
+        - Applies only when both sides have jersey and text matches.
+        - Scales bonus by normalized confidences with a cap `ocr_bonus_max`.
+        """
+        try:
+            if not (self.cfg.ocr_enable):
+                return 0.0
+            if not jtxt or jconf is None:
+                return 0.0
+            if not track.jersey or str(track.jersey) != str(jtxt):
+                return 0.0
+            # Require detection OCR above min conf
+            if float(jconf) < float(self.cfg.ocr_min_conf):
+                return 0.0
+            # Normalize confidences to [0,1] from [ocr_min_conf, 1]
+            mn = float(self.cfg.ocr_min_conf)
+            def _norm(c: float) -> float:
+                return max(0.0, min(1.0, (float(c) - mn) / (1.0 - mn + 1e-6)))
+            nd = _norm(float(jconf))
+            nt = _norm(float(getattr(track, 'jersey_conf', 0.0)))
+            strength = math.sqrt(max(0.0, nd * nt))  # conservative combine
+            return min(float(self.cfg.ocr_bonus_max), strength * float(self.cfg.ocr_bonus_max))
+        except Exception:
+            return 0.0
 
     def _size_gate(self, track: Track, det_tlbr: Tuple[int, int, int, int]) -> bool:
         x1, y1, x2, y2 = det_tlbr
@@ -238,6 +294,7 @@ class ByteTrackReID:
                             continue
                         if not self._size_gate(t, tlbr):
                             continue
+                        # No Kalman gating
                         # Jersey mismatch gate when both available
                         if (t.jersey and t.jersey_conf >= self.cfg.jersey_min_track_conf) and (jtxt and jconf >= self.cfg.ocr_min_conf):
                             if str(t.jersey) != str(jtxt):
@@ -247,16 +304,16 @@ class ByteTrackReID:
                             if (sim < self.cfg.switch_min_sim) and (iou < max(0.5, self.cfg.match_iou_thresh)):
                                 continue
                         s = self._score(t, tlbr, emb)
-                        if (t.jersey and jtxt) and (str(t.jersey) == str(jtxt)):
-                            s = min(1.0, s + 0.25)
+                        # Dynamic OCR bonus when jersey matches
+                        s = min(1.0, s + self._ocr_bonus(t, jtxt, jconf))
                         cost[i, j] = 1.0 - max(0.0, min(1.0, s))
                 row_ind, col_ind = linear_sum_assignment(cost)
                 matched_t = set()
                 used_d = set()
                 for r, c in zip(row_ind, col_ind):
                     if cost[r, c] <= 0.8:  # allow fairly loose; main gate is IoU
-                        tlbr, conf, emb = dets[c]
-                        tracks[r].update(tlbr, conf, emb, frame_idx)
+                        tlbr, conf, emb, jtxt, jconf = dets[c]
+                        tracks[r].update(tlbr, conf, emb, frame_idx, jersey_obs=(jtxt, jconf))
                         matched_t.add(r)
                         used_d.add(c)
                 unmatched_d = set(range(M)) - used_d
@@ -277,6 +334,7 @@ class ByteTrackReID:
                             continue
                         if not self._size_gate(t, tlbr):
                             continue
+                        # No Kalman gating
                         if (t.jersey and t.jersey_conf >= self.cfg.jersey_min_track_conf) and (jtxt and jconf >= self.cfg.ocr_min_conf):
                             if str(t.jersey) != str(jtxt):
                                 continue
@@ -284,31 +342,28 @@ class ByteTrackReID:
                             if (sim < self.cfg.switch_min_sim) and (iou < max(0.5, self.cfg.match_iou_thresh)):
                                 continue
                         s = self._score(t, tlbr, emb)
-                        if (t.jersey and jtxt) and (str(t.jersey) == str(jtxt)):
-                            s = min(1.0, s + 0.25)
+                        s = min(1.0, s + self._ocr_bonus(t, jtxt, jconf))
                         if s > best_score:
                             best_score = s
                             best_idx = j
                     if best_idx >= 0:
                         tlbr, conf, emb, jtxt, jconf = dets[best_idx]
-                        t.update(tlbr, conf, emb, frame_idx)
-                        if jtxt and jconf >= self.cfg.ocr_min_conf:
-                            if (not t.jersey) or (jtxt == t.jersey and jconf > t.jersey_conf):
-                                t.jersey = str(jtxt)
-                                t.jersey_conf = float(jconf)
+                        t.update(tlbr, conf, emb, frame_idx, jersey_obs=(jtxt, jconf))
                         unmatched.discard(best_idx)
                 return set(), unmatched
 
         # First association: high-score detections
-        _assign(self.tracks, high_dets)
+        _, high_unmatched = _assign(self.tracks, high_dets)
 
         # Second association: unassigned tracks with low-score detections
+        low_unmatched = set(range(len(low_dets)))
         if low_dets:
-            _assign(self.tracks, low_dets)
+            _, low_unmatched = _assign(self.tracks, low_dets)
 
         # Create new tracks for unmatched high_dets first, then low_dets
-        def _spawn(dets_list):
-            for item in dets_list:
+        def _spawn(dets_list, idxs):
+            for idx in idxs:
+                item = dets_list[idx]
                 tlbr, conf, emb = item[0], item[1], item[2]
                 # Spawn only if not already close to an existing active track (reduce duplicates)
                 ok = True
@@ -317,12 +372,12 @@ class ByteTrackReID:
                         ok = False
                         break
                 if ok:
-                    t = Track(self._next_id, tlbr, conf, emb, frame_idx)
+                    t = Track(self._next_id, tlbr, conf, emb, frame_idx, cfg=self.cfg)
                     self._next_id += 1
                     self.tracks.append(t)
 
-        _spawn(high_dets)
-        _spawn(low_dets)
+        _spawn(high_dets, high_unmatched)
+        _spawn(low_dets, low_unmatched)
 
         # Cleanup old tracks
         self._cleanup()
@@ -346,6 +401,7 @@ class ByteTrackReID:
                 }
                 if t.jersey:
                     row["jersey"] = t.jersey
+                # No Kalman debug fields
                 out.append(row)
         return out
 

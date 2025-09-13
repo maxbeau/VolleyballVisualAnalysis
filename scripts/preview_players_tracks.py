@@ -150,6 +150,8 @@ def main():
                     label += f" #{jersey}"
             cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
+            # (Kalman debug drawing removed)
+
         # Interp/hold for missing IDs
         interp_enable = bool(getattr(settings, 'PLAYERS_INTERP_ENABLE', True))
         interp_max_gap = int(getattr(settings, 'PLAYERS_INTERP_MAX_GAP', 6))

@@ -42,6 +42,10 @@ def main():
     parser.add_argument("--reid-weight", type=float, default=settings.PLAYERS_REID_WEIGHT)
     parser.add_argument("--max-age", type=int, default=settings.PLAYERS_MAX_AGE)
     parser.add_argument("--min-hits", type=int, default=settings.PLAYERS_MIN_HITS)
+    # Advanced tracking params (optional)
+    parser.add_argument("--id-lock-age", type=int, default=None, help="Frames to lock ID after hit (anti-switch)")
+    parser.add_argument("--switch-min-sim", type=float, default=None, help="Min ReID sim to switch when locked")
+    # Kalman removed for players tracking (no CLI args)
     args = parser.parse_args()
 
     vid_path = settings.VIDEO_PATH
@@ -65,6 +69,12 @@ def main():
         max_age=args.max_age,
         min_hits=args.min_hits,
     )
+    # Optional advanced params
+    if args.id_lock_age is not None:
+        cfg.id_lock_age = int(args.id_lock_age)
+    if args.switch_min_sim is not None:
+        cfg.switch_min_sim = float(args.switch_min_sim)
+    # No Kalman-related config assignment
     # Apply OCR settings
     cfg.ocr_enable = bool(getattr(settings, "PLAYERS_OCR_ENABLE", False))
     cfg.ocr_min_conf = float(getattr(settings, "PLAYERS_OCR_MIN_CONF", 0.5))
