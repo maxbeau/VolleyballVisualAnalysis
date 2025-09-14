@@ -142,16 +142,16 @@ def _node_cost(p: Dict[str, Any], settings, img_wh: Optional[Tuple[int, int]] = 
     conf = max(1e-6, min(1.0, float(p.get("confidence", 0.0))))
     w = float(p.get("width", 0.0)); h = float(p.get("height", 0.0))
     ar_dev = abs((w / max(h, 1e-6)) - 1.0) if (w > 0 and h > 0) else 1.0
-    cost = settings.VIT_W_CONF * (-math.log(conf)) + settings.VIT_W_AR * ar_dev
+    cost = settings.ball.VIT_W_CONF * (-math.log(conf)) + settings.ball.VIT_W_AR * ar_dev
     # Circle quality (if available): penalize low q
     try:
         q = float(p.get("circle", {}).get("q", None))
         if q is not None:
-            cost += settings.VIT_W_CIRCLE * (1.0 - max(0.0, min(1.0, q)))
+            cost += settings.ball.VIT_W_CIRCLE * (1.0 - max(0.0, min(1.0, q)))
     except Exception:
         pass
     # Border proximity penalty (optional)
-    if img_wh is not None and settings.VIT_W_BORDER > 0.0:
+    if img_wh is not None and settings.ball.VIT_W_BORDER > 0.0:
         try:
             iw, ih = int(img_wh[0]), int(img_wh[1])
             # prefer circle center if present
@@ -159,10 +159,10 @@ def _node_cost(p: Dict[str, Any], settings, img_wh: Optional[Tuple[int, int]] = 
             cx = float(circ.get("u", p.get("x", 0.0)))
             cy = float(circ.get("v", p.get("y", 0.0)))
             d_edge = min(cx, iw - cx, cy, ih - cy)
-            margin = max(1.0, float(settings.IMAGE_BORDER_MARGIN_PX))
+            margin = max(1.0, float(settings.ball.IMAGE_BORDER_MARGIN_PX))
             if d_edge < margin:
                 t = (margin - d_edge) / margin
-                cost += settings.VIT_W_BORDER * t
+                cost += settings.ball.VIT_W_BORDER * t
         except Exception:
             pass
     return cost
@@ -172,11 +172,11 @@ def _edge_cost(pa: Dict[str, Any], pb: Dict[str, Any], dt_frames: int, settings)
     dx = float(pb.get("x", 0.0)) - float(pa.get("x", 0.0))
     dy = float(pb.get("y", 0.0)) - float(pa.get("y", 0.0))
     dist = (dx * dx + dy * dy) ** 0.5
-    sigma = max(1.0, settings.CONT_MAX_JUMP_PX * max(1, dt_frames))
-    c_dist = settings.VIT_W_DIST * (dist / sigma) ** 2
+    sigma = max(1.0, settings.ball.CONT_MAX_JUMP_PX * max(1, dt_frames))
+    c_dist = settings.ball.VIT_W_DIST * (dist / sigma) ** 2
     wa = max(1e-6, float(pa.get("width", 1.0))); ha = max(1e-6, float(pa.get("height", 1.0)))
     wb = max(1e-6, float(pb.get("width", 1.0))); hb = max(1e-6, float(pb.get("height", 1.0)))
-    c_size = settings.VIT_W_SIZE * (abs(math.log(wb/wa)) + abs(math.log(hb/ha)))
+    c_size = settings.ball.VIT_W_SIZE * (abs(math.log(wb/wa)) + abs(math.log(hb/ha)))
     return c_dist + c_size
 
 
@@ -184,7 +184,7 @@ def _dir_accel_cost(pp: Dict[str, Any], pa: Dict[str, Any], pb: Dict[str, Any], 
     """Second-order kinematic penalty using direction change and acceleration.
     pp -> pa -> pb, dt assumed = 1 frame.
     """
-    if settings.VIT_W_DIR == 0.0 and settings.VIT_W_ACCEL == 0.0:
+    if settings.ball.VIT_W_DIR == 0.0 and settings.ball.VIT_W_ACCEL == 0.0:
         return 0.0
     try:
         xpp, ypp = float(pp.get("x", 0.0)), float(pp.get("y", 0.0))
@@ -201,17 +201,17 @@ def _dir_accel_cost(pp: Dict[str, Any], pa: Dict[str, Any], pb: Dict[str, Any], 
         try:
             import math as _m
             ang_deg = _m.degrees(_m.acos(cos_th))
-            if ang_deg > max(0.0, float(settings.VIT_DIR_MAX_DEG)):
+            if ang_deg > max(0.0, float(settings.ball.VIT_DIR_MAX_DEG)):
                 return float('inf')
         except Exception:
             pass
         dir_pen = (1.0 - cos_th)
-        dir_cost = settings.VIT_W_DIR * (dir_pen * dir_pen)
+        dir_cost = settings.ball.VIT_W_DIR * (dir_pen * dir_pen)
         # Acceleration penalty: |v2 - v1| normalized by CONT_MAX_JUMP_PX
         ax = v2x - v1x; ay = v2y - v1y
         a = (ax*ax + ay*ay) ** 0.5
-        sigma_v = max(1.0, float(settings.CONT_MAX_JUMP_PX))
-        acc_cost = settings.VIT_W_ACCEL * (a / sigma_v) ** 2
+        sigma_v = max(1.0, float(settings.ball.CONT_MAX_JUMP_PX))
+        acc_cost = settings.ball.VIT_W_ACCEL * (a / sigma_v) ** 2
         return dir_cost + acc_cost
     except Exception:
         return 0.0
@@ -238,7 +238,7 @@ def select_by_viterbi(
     tops: Dict[int, List[Dict[str, Any]]] = {}
     for f in frames:
         cands = sorted(preds_by_frame[f], key=lambda p: float(p.get("confidence", 0.0)), reverse=True)
-        tops[f] = cands[: max(1, settings.VIT_TOPK)]
+        tops[f] = cands[: max(1, settings.ball.VIT_TOPK)]
 
     # DP: for each frame f, we store states 0..K (K=index for Null)
     dp_cost: Dict[int, List[float]] = {}
@@ -254,9 +254,9 @@ def select_by_viterbi(
     dp_prev[f0] = [(None, None)] * K0
     # candidate states
     for i, p in enumerate(tops[f0]):
-        dp_cost[f0][i] = _node_cost(p, settings, img_wh) + settings.VIT_START_PENALTY
+        dp_cost[f0][i] = _node_cost(p, settings, img_wh) + settings.ball.VIT_START_PENALTY
     # null state
-    dp_cost[f0][K0 - 1] = settings.VIT_GAP_PENALTY  # null node cost
+    dp_cost[f0][K0 - 1] = settings.ball.VIT_GAP_PENALTY  # null node cost
 
     # Transition frame by frame
     for t in range(1, len(frames)):
@@ -273,7 +273,7 @@ def select_by_viterbi(
             if i < len(tops[f]):
                 node_c = _node_cost(tops[f][i], settings, img_wh)
             else:
-                node_c = settings.VIT_GAP_PENALTY
+                node_c = settings.ball.VIT_GAP_PENALTY
 
             # Try all previous states
             for j in range(Kp):
@@ -289,7 +289,7 @@ def select_by_viterbi(
                     dx = float(pb.get("x", 0.0)) - float(pa.get("x", 0.0))
                     dy = float(pb.get("y", 0.0)) - float(pa.get("y", 0.0))
                     dist = (dx * dx + dy * dy) ** 0.5
-                    if dist > settings.CONT_MAX_JUMP_PX * 1.5:
+                    if dist > settings.ball.CONT_MAX_JUMP_PX * 1.5:
                         continue
                     edge_c = _edge_cost(pa, pb, 1, settings)
                     # Add second-order kinematic term if previous of (pf,j) exists and is candidate
@@ -302,7 +302,7 @@ def select_by_viterbi(
                         edge_c += dk
                 elif j == len(tops[pf]) and i < len(tops[f]):
                     # null -> candidate: start penalty
-                    edge_c = settings.VIT_START_PENALTY
+                    edge_c = settings.ball.VIT_START_PENALTY
                 else:
                     # candidate/null -> null : no extra edge cost
                     edge_c = 0.0
@@ -437,33 +437,33 @@ def build_ball_tracks(
     Returns (best_tracks, debug_info).
     """
     # Load detections
-    if getattr(settings, 'USE_VITERBI_SELECTION', False):
+    if getattr(settings.ball, 'USE_VITERBI_SELECTION', False):
         preds_by_frame = load_all_ball_preds_per_frame(jsonl_path, allowed_classes)
         best = select_by_viterbi(preds_by_frame, fps, settings, img_wh=img_wh)
         retro_pruned_frames = set()
         confirm_pruned_frames = set()
         confirm_replaced_targets = set()
-    elif settings.USE_CONTINUITY_SELECTION:
+    elif settings.ball.USE_CONTINUITY_SELECTION:
         preds_by_frame = load_all_ball_preds_per_frame(jsonl_path, allowed_classes)
         best = select_by_continuity(
             preds_by_frame,
-            max_jump_px=max(5.0, settings.CONT_MAX_JUMP_PX),
-            topk=max(1, settings.CONT_SEARCH_TOPK),
-            reseed_misses=max(0, settings.CONT_RESEED_MISSES),
+            max_jump_px=max(5.0, settings.ball.CONT_MAX_JUMP_PX),
+            topk=max(1, settings.ball.CONT_SEARCH_TOPK),
+            reseed_misses=max(0, settings.ball.CONT_RESEED_MISSES),
         )
         # Confirm reseeds
         best, confirm_removed, confirm_replaced = confirm_reseeds(
             best,
-            settings.CONFIRM_RESEED_LOOKAHEAD,
-            settings.CONFIRM_RESEED_MIN_MOVE_PX,
-            settings.CONFIRM_MIN_CONF,
-            settings.CONFIRM_MAX_AR_DEV,
+            settings.ball.CONFIRM_RESEED_LOOKAHEAD,
+            settings.ball.CONFIRM_RESEED_MIN_MOVE_PX,
+            settings.ball.CONFIRM_MIN_CONF,
+            settings.ball.CONFIRM_MAX_AR_DEV,
         )
         confirm_pruned_frames = set(confirm_removed)
         confirm_replaced_targets = set(g for f, g in confirm_replaced)
         # Retro prune
         before_keys = set(best.keys())
-        best = retro_prune_segments(best, settings.RETRO_MIN_SEG_LEN, settings.RETRO_MIN_SEG_MOVE_PX)
+        best = retro_prune_segments(best, settings.ball.RETRO_MIN_SEG_LEN, settings.ball.RETRO_MIN_SEG_MOVE_PX)
         after_keys = set(best.keys())
         retro_pruned_frames = before_keys - after_keys
     else:

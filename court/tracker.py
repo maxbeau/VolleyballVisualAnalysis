@@ -3,7 +3,7 @@ from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 import cv2
 
-from court.config import CourtTrackerConfig
+from config.court import CourtSettings
 from court.utils import (
     order_corners,
     apply_homography_points,
@@ -110,8 +110,8 @@ class CourtLKTracker:
     - Refinement: cornerSubPix for the 4 corners projected by curr_H.
     """
 
-    def __init__(self, cfg: Optional[CourtTrackerConfig] = None, **kwargs) -> None:
-        self.cfg = cfg or CourtTrackerConfig()
+    def __init__(self, cfg: Optional[CourtSettings] = None, **kwargs) -> None:
+        self.cfg = cfg or CourtSettings()
         # allow kwargs overrides for backwards compat
         for k, v in kwargs.items():
             if hasattr(self.cfg, k):

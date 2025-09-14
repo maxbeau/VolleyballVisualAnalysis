@@ -1,0 +1,6 @@
+inference-sdk
+opencv-python
+numpy
+python-dotenv
+pydantic
+pydantic-settings

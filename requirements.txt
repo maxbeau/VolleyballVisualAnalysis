@@ -1,4 +1,0 @@
-inference-sdk
-opencv-python
-numpy
-python-dotenv

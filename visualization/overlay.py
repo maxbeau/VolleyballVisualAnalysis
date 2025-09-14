@@ -8,7 +8,7 @@ import numpy as np
 from court.utils import standard_court_model_size
 from visualization.mini_birdseye import MiniBirdseyeOverlay
 from court.orientation import decide_orientation as decide_court_orientation
-from core.config import settings
+from config import settings
 from core.utils import ensure_dir
 from analysis.smoothing import kalman_rts_smooth
 from analysis.kinematic_filter import filter_by_kinematics
@@ -81,34 +81,34 @@ def pred_with_kalman_or_hold(
 
 
 def main():
-    jsonl_path = settings.BALL_DETECTIONS_JSONL
-    out_path = settings.BALL_OVERLAY_FULL
-    max_gap_frames = settings.MAX_INTERP_GAP_FRAMES
-    hold_mode = "prev" if settings.HOLD_MODE else "none"
-    hold_ttl = settings.HOLD_TTL_FRAMES
+    jsonl_path = settings.ball.DETECTIONS_JSONL
+    out_path = settings.common.BALL_OVERLAY_FULL
+    max_gap_frames = settings.ball.MAX_INTERP_GAP_FRAMES
+    hold_mode = "prev" if settings.ball.HOLD_MODE else "none"
+    hold_ttl = settings.ball.HOLD_TTL_FRAMES
     allowed = ["ball", "volleyball"]
-    min_conf = settings.OVERLAY_MIN_CONF
+    min_conf = settings.common.OVERLAY_MIN_CONF
     color = (0, 255, 0)
     thickness = 2
-    show_labels = settings.SHOW_BOX_LABELS
+    show_labels = settings.common.SHOW_BOX_LABELS
     # Court overlay config
-    court_overlay = settings.COURT_OVERLAY
+    court_overlay = settings.court.OVERLAY
     court_json = "outputs/court_corners_integrated.json"
-    court_tracking_jsonl = settings.COURT_TRACKING_JSONL
-    court_method = settings.COURT_OVERLAY_METHOD
-    court_color = settings.COURT_COLOR
-    court_thickness = settings.COURT_THICKNESS
-    court_center_color = settings.COURT_CENTER_COLOR
-    court_attack_color = settings.COURT_ATTACK_COLOR
+    court_tracking_jsonl = settings.court.TRACKING_JSONL
+    court_method = settings.court.OVERLAY_METHOD
+    court_color = settings.court.COLOR
+    court_thickness = settings.court.THICKNESS
+    court_center_color = settings.court.CENTER_COLOR
+    court_attack_color = settings.court.ATTACK_COLOR
     # Players overlay (tracks with IDs/jersey)
-    players_tracks_jsonl = getattr(settings, "PLAYERS_TRACKS_JSONL", os.path.join("outputs", "players_tracks.jsonl"))
+    players_tracks_jsonl = getattr(settings.players, "TRACKS_JSONL", os.path.join("outputs", "players_tracks.jsonl"))
     players_enable = os.path.exists(players_tracks_jsonl)
 
     ball_available = os.path.exists(jsonl_path)
     if not ball_available:
         print(f"Ball JSONL not found: {jsonl_path}. Proceeding without ball boxes.")
 
-    video_path = settings.VIDEO_PATH
+    video_path = settings.common.VIDEO_PATH
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -127,7 +127,7 @@ def main():
         resize_needed = False
 
     ensure_dir(os.path.dirname(out_path) or ".")
-    codec = settings.OVERLAY_CODEC
+    codec = settings.common.OVERLAY_CODEC
     fourcc = cv2.VideoWriter_fourcc(*codec)
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
@@ -160,9 +160,9 @@ def main():
         confirm_replaced_targets = set()
 
     # Aspect-ratio soft weighting (no size constraints)
-    f_min_ar = settings.FILTER_MIN_ASPECT_RATIO
-    f_max_ar = settings.FILTER_MAX_ASPECT_RATIO
-    ar_alpha = settings.FILTER_AR_SOFT_ALPHA
+    f_min_ar = settings.ball.FILTER_MIN_ASPECT_RATIO
+    f_max_ar = settings.ball.FILTER_MAX_ASPECT_RATIO
+    ar_alpha = settings.ball.FILTER_AR_SOFT_ALPHA
     adjusted = {}
     softened = 0
     for k, p in best.items():
@@ -215,7 +215,7 @@ def main():
             players_ts = None
 
     # Manual exclude list from env (e.g., "20-33,244,252")
-    frames_excluded_list = set(parse_frame_spec(settings.BALL_EXCLUDE_FRAMES))
+    frames_excluded_list = set(parse_frame_spec(settings.ball.EXCLUDE_FRAMES))
     if frames_excluded_list:
         before = len(best)
         best = {k: v for k, v in best.items() if k not in frames_excluded_list}
@@ -223,10 +223,10 @@ def main():
         print(f"Manual exclude list: removed {removed} frames by BALL_EXCLUDE_FRAMES; kept {len(best)}")
     # Early load of court timeseries for ROI gating (if available)
     court_timeseries_early: Optional[Dict[int, List[Tuple[float, float]]]] = None
-    if settings.COURT_OVERLAY and os.path.exists(settings.COURT_TRACKING_JSONL):
+    if settings.court.OVERLAY and os.path.exists(settings.court.TRACKING_JSONL):
         court_timeseries_early = {}
         try:
-            with open(settings.COURT_TRACKING_JSONL, "r", encoding="utf-8") as cf:
+            with open(settings.court.TRACKING_JSONL, "r", encoding="utf-8") as cf:
                 for line in cf:
                     line = line.strip()
                     if not line:
@@ -240,7 +240,7 @@ def main():
         except Exception:
             court_timeseries_early = None
     # ROI gate: drop detections whose center lies outside court polygon (per-frame if available)
-    if court_timeseries_early and settings.COURT_ROI_FILTER:
+    if court_timeseries_early and settings.court.ROI_FILTER:
         filtered_roi = {}
         roi_removed = 0
         import numpy as _np
@@ -271,7 +271,7 @@ def main():
     # Keep a copy before manual/kinematic filtering for debug visualization
     best_pre_kin = dict(adjusted)
     # Optional kinematic filtering in image space (pre-smoothing)
-    if settings.KINEMATIC_FILTER_ENABLE and frames_with_pred:
+    if settings.ball.KINEMATIC_FILTER_ENABLE and frames_with_pred:
         best_before = len(best)
         # Build warmup set: size gate disabled on reseed frames and confirm-replaced targets
         warmup_frames = set(k for k, p in best.items() if isinstance(p, dict) and p.get("_reseed"))
@@ -283,20 +283,20 @@ def main():
         best = filter_by_kinematics(
             best,
             fps=fps,
-            max_speed_px_per_s=settings.KIN_MAX_SPEED_PX_PER_S,
-            max_accel_px_per_s2=settings.KIN_MAX_ACCEL_PX_PER_S2,
-            max_dir_change_deg=settings.KIN_MAX_DIR_CHANGE_DEG,
-            max_size_change_frac_per_s=settings.KIN_MAX_SIZE_FRAC_PER_S,
-            static_filter_enable=settings.KIN_STATIC_FILTER_ENABLE,
-            static_min_speed_px_per_s=settings.KIN_STATIC_MIN_SPEED_PX_PER_S,
-            static_min_frames=settings.KIN_STATIC_MIN_FRAMES,
-            enable_speed_gate=settings.KIN_ENABLE_SPEED_GATE,
-            enable_accel_gate=settings.KIN_ENABLE_ACCEL_GATE,
-            enable_dir_gate=settings.KIN_ENABLE_DIR_GATE,
-            enable_size_gate=settings.KIN_ENABLE_SIZE_GATE,
-            dyn_enable=settings.KIN_DYN_ENABLE,
-            dyn_min_mult=settings.KIN_DYN_MIN_MULT,
-            dyn_max_mult=settings.KIN_DYN_MAX_MULT,
+            max_speed_px_per_s=settings.ball.KIN_MAX_SPEED_PX_PER_S,
+            max_accel_px_per_s2=settings.ball.KIN_MAX_ACCEL_PX_PER_S2,
+            max_dir_change_deg=settings.ball.KIN_MAX_DIR_CHANGE_DEG,
+            max_size_change_frac_per_s=settings.ball.KIN_MAX_SIZE_FRAC_PER_S,
+            static_filter_enable=settings.ball.KIN_STATIC_FILTER_ENABLE,
+            static_min_speed_px_per_s=settings.ball.KIN_STATIC_MIN_SPEED_PX_PER_S,
+            static_min_frames=settings.ball.KIN_STATIC_MIN_FRAMES,
+            enable_speed_gate=settings.ball.KIN_ENABLE_SPEED_GATE,
+            enable_accel_gate=settings.ball.KIN_ENABLE_ACCEL_GATE,
+            enable_dir_gate=settings.ball.KIN_ENABLE_DIR_GATE,
+            enable_size_gate=settings.ball.KIN_ENABLE_SIZE_GATE,
+            dyn_enable=settings.ball.KIN_DYN_ENABLE,
+            dyn_min_mult=settings.ball.KIN_DYN_MIN_MULT,
+            dyn_max_mult=settings.ball.KIN_DYN_MAX_MULT,
             warmup_disable_size_frames=warmup_frames,
         )
         removed = best_before - len(best)
@@ -308,13 +308,13 @@ def main():
     frames_kept = set(best.keys())
     frames_filtered = frames_raw - frames_kept
     # Observation gating configuration
-    gate_chisq = settings.OBS_GATE_CHISQ_THRESH
-    gate_use_conf = settings.OBS_GATE_USE_CONF
+    gate_chisq = settings.ball.OBS_GATE_CHISQ_THRESH
+    gate_use_conf = settings.ball.OBS_GATE_USE_CONF
     # Gravity configuration (pixels per second squared)
-    gravity_pps2 = settings.GRAVITY_PPS2
+    gravity_pps2 = settings.ball.GRAVITY_PPS2
     # Convert to per-frame acceleration: g / fps^2
     gravity_per_frame = (gravity_pps2 / (fps * fps)) if fps and fps > 0 else 0.0
-    smoothing_enable = settings.SMOOTHING_ENABLE
+    smoothing_enable = settings.ball.SMOOTHING_ENABLE
     if ball_available and best and smoothing_enable:
         smoothed = kalman_rts_smooth(
             best,
@@ -330,7 +330,7 @@ def main():
     interp_count = 0
     hold_count = 0
     # For evaluation: non-ball frames spec (not used for filtering)
-    eval_nonball = set(parse_frame_spec(settings.EVAL_NONBALL_FRAMES))
+    eval_nonball = set(parse_frame_spec(settings.ball.EVAL_NONBALL_FRAMES))
     eval_enable = len(eval_nonball) > 0
     eval_tp = eval_fn = eval_fp = eval_tn = 0
     # Prepare domain for eval: only consider frames that had any raw candidate
@@ -382,15 +382,15 @@ def main():
         tpl_line_px=max(1, court_thickness),
         center_color=court_center_color,
         attack_color=court_attack_color,
-        diag=settings.COURT_SHOW_DIAG,
+        diag=settings.court.SHOW_DIAG,
     )
 
     # Mini bird's-eye overlay preparation (top-right), using orientation meta or decision
-    mini_enable = bool(getattr(settings, "COURT_MINI_ENABLE", True))
+    mini_enable = bool(getattr(settings.court, "MINI_ENABLE", True))
     mini_orient = None
     if mini_enable:
         try:
-            with open(getattr(settings, "COURT_TRACKING_META", ""), "r", encoding="utf-8") as mf:
+            with open(getattr(settings.court, "TRACKING_META", ""), "r", encoding="utf-8") as mf:
                 meta = json.load(mf)
                 mini_orient = str(meta.get("orientation")) if isinstance(meta, dict) else None
         except Exception:
@@ -405,16 +405,16 @@ def main():
                                                                (float(cs[1][0]), float(cs[1][1])),
                                                                (float(cs[2][0]), float(cs[2][1])),
                                                                (float(cs[3][0]), float(cs[3][1]))]}
-            mini_orient = decide_court_orientation(cap, ts_for_orient, (Wm, Hm), mode=getattr(settings, "COURT_MINI_ORIENT_MODE", "template"))
+            mini_orient = decide_court_orientation(cap, ts_for_orient, (Wm, Hm), mode=getattr(settings.court, "MINI_ORIENT_MODE", "template"))
         tpl_colors = {"border": court_color, "center": court_center_color, "attack": court_attack_color}
         mini = MiniBirdseyeOverlay(
             colors=tpl_colors,
             thickness=court_thickness,
-            placement=getattr(settings, "COURT_MINI_PLACEMENT", "top-right"),
-            scale=getattr(settings, "COURT_MINI_SCALE", 0.24),
+            placement=getattr(settings.court, "MINI_PLACEMENT", "top-right"),
+            scale=getattr(settings.court, "MINI_SCALE", 0.24),
             margin=12,
-            show_label=getattr(settings, "COURT_MINI_SHOW_LABEL", True),
-            draw_poly=getattr(settings, "COURT_MINI_DRAW_POLY", True),
+            show_label=getattr(settings.court, "MINI_SHOW_LABEL", True),
+            draw_poly=getattr(settings.court, "MINI_DRAW_POLY", True),
         )
         mini_label = mini_orient
 
@@ -435,6 +435,12 @@ def main():
             cv2.putText(frame, hud_txt, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
         except Exception:
             pass
+
+        # Prepare raw-frame metadata for drawing near-box markers (no global KEPT/REJECT status HUD)
+        raw = best_pre_kin.get(i)
+        had_raw = i in frames_raw
+        kept_raw = i in frames_kept
+        was_filtered = i in frames_filtered
 
         if smoothing_enable:
             pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl) if ball_available else None
@@ -457,13 +463,9 @@ def main():
                 drawn += 1
         else:
             # Raw per-frame visualization: draw near-ball keep/filter markers
-            raw = best_pre_kin.get(i)
-            had_raw = i in frames_raw
-            kept_raw = i in frames_kept
-            was_filtered = i in frames_filtered
             # Optional court ROI masking in raw mode: if court timeseries available and we have corners
             # treat detections outside the court polygon as filtered for visualization
-            if had_raw and settings.COURT_ROI_FILTER:
+            if had_raw and settings.court.ROI_FILTER:
                 # choose corners for current frame if available; else last_court_pts if exists
                 poly_pts = None
                 if court_timeseries is not None and (i in court_timeseries or 'last_court_pts' in locals()):
@@ -496,11 +498,13 @@ def main():
                                 tag = "KEPT (reseed)"
                         except Exception:
                             pass
-                        cv2.putText(frame, tag, (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,0), 2, cv2.LINE_AA)
+                        if getattr(settings.ball, "SHOW_NEAR_BOX_TAGS", True):
+                            cv2.putText(frame, tag, (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,0), 2, cv2.LINE_AA)
                         drawn += 1
                     else:
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), max(1, thickness-1))
-                        cv2.putText(frame, "KEPT<CONF", (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                        if getattr(settings.ball, "SHOW_NEAR_BOX_TAGS", True):
+                            cv2.putText(frame, "KEPT<CONF", (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
                 else:
                     # Filtered by manual list or kinematics: draw red thin box with EXCL/FILT near box
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), max(1, thickness-1))
@@ -508,7 +512,11 @@ def main():
                         "PRUNE" if ('retro_pruned_frames' in locals() and i in retro_pruned_frames) else (
                         "CFM" if ('confirm_pruned_frames' in locals() and i in confirm_pruned_frames) else "FILT")
                     )
-                    cv2.putText(frame, tag, (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+                    if getattr(settings.ball, "SHOW_NEAR_BOX_TAGS", True):
+                        cv2.putText(frame, tag, (x2 + 6, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+
+        # Draw the per-frame status HUD line (top-left under FPS), even if no box is drawn
+        # No global KEPT/REJECT/NONE status HUD rendering
 
         # For smoothing-enabled path we already draw standard labels; for raw path we drew near-box status above.
 
@@ -594,7 +602,7 @@ def main():
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
         # Draw players overlay (IDs and optional jersey)
-        if players_ts is not None:
+        if settings.players.SHOW_BOX and players_ts is not None:
             try:
                 trs = players_ts.get(i)
                 if trs:
