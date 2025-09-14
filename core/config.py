@@ -19,6 +19,12 @@ class Settings:
         self.INFER_FPS: int = int(os.getenv("INFER_FPS", "12"))
         self.CACHE_DIR: str = os.getenv("CACHE_DIR", "outputs/preds")
         
+        # Actions Detection (Roboflow volleyball-actions/4)
+        self.ACTIONS_DETECTIONS_JSONL: str = os.getenv("ACTIONS_DETECTIONS_JSONL", "outputs/actions_detections.jsonl")
+        self.ACTIONS_CACHE_DIR: str = os.getenv("ACTIONS_CACHE_DIR", "outputs/actions_preds")
+        self.ACTIONS_SAVE_FRAME_JSON: bool = os.getenv("ACTIONS_SAVE_FRAME_JSON", "true").lower() == "true"
+        self.ACTIONS_INFER_FPS: int = int(os.getenv("ACTIONS_INFER_FPS", "12"))
+        
         # Players Detection
         self.PLAYERS_DETECTIONS_JSONL: str = os.getenv("PLAYERS_DETECTIONS_JSONL", "outputs/players_detections.jsonl")
         self.PLAYERS_CACHE_DIR: str = os.getenv("PLAYERS_CACHE_DIR", "outputs/players_preds")
@@ -69,6 +75,7 @@ class Settings:
         # Overlay Output
         self.BALL_OVERLAY_FULL: str = os.getenv("BALL_OVERLAY_FULL", "outputs/final_overlay.mp4")
         self.PLAYERS_OVERLAY_FULL: str = os.getenv("PLAYERS_OVERLAY_FULL", "outputs/players_overlay.mp4")
+        self.ACTIONS_OVERLAY_FULL: str = os.getenv("ACTIONS_OVERLAY_FULL", "outputs/actions_overlay.mp4")
         self.OVERLAY_MIN_CONF: float = float(os.getenv("OVERLAY_MIN_CONF", "0.1"))
         self.SHOW_BOX_LABELS: bool = os.getenv("SHOW_BOX_LABELS", "false").lower() == "true"
         self.OVERLAY_CODEC: str = os.getenv("OVERLAY_CODEC", "avc1")
