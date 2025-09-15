@@ -16,8 +16,19 @@ def load_detections(detections_jsonl: str) -> List[Dict[str, Any]]:
             fr = int(rec.get("frame", 0))
             best = rec.get("pred")
             corners = rec.get("corners")
-            if not corners and isinstance(best, dict):
-                corners = corners_from_prediction(best)
+            if not corners:
+                if not best:
+                    preds = rec.get("predictions")
+                    if isinstance(preds, list) and preds:
+                        try:
+                            best = max(preds, key=lambda p: float(p.get("confidence", 0.0) or 0.0))
+                        except Exception:
+                            best = preds[0]
+                if isinstance(best, dict):
+                    try:
+                        corners = corners_from_prediction(best)
+                    except Exception:
+                        corners = None
             if corners and len(corners) >= 4:
                 dets.append({"frame": fr, "corners": order_corners([(float(x), float(y)) for x, y in corners[:4]])})
     dets.sort(key=lambda r: r["frame"])
@@ -34,4 +45,3 @@ def load_detections(detections_jsonl: str) -> List[Dict[str, Any]]:
 
 
 __all__ = ["load_detections"]
-

@@ -2,7 +2,7 @@ import argparse
 import os
 from typing import Dict, List, Any, Callable, Optional
 
-from config import settings, BallSettings, PlayersSettings, ActionsSettings
+from config import settings, BallSettings, PlayersSettings, ActionsSettings, CourtSettings
 from core.pipeline import DetectionPipeline
 
 # --- Prediction Extractors ---
@@ -45,6 +45,7 @@ TARGETS: Dict[str, TargetConfig] = {
     "ball": TargetConfig(settings.ball, _default_pred_extractor),
     "players": TargetConfig(settings.players, _default_pred_extractor),
     "actions": TargetConfig(settings.actions, _actions_pred_extractor),
+    "court": TargetConfig(settings.court, _default_pred_extractor),
 }
 
 # --- Main Execution ---

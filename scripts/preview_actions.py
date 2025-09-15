@@ -85,7 +85,7 @@ def main():
     parser.add_argument("--actions-jsonl", default=settings.ACTIONS_DETECTIONS_JSONL)
     parser.add_argument("--out", default=settings.ACTIONS_OVERLAY_FULL)
     parser.add_argument("--min-conf", type=float, default=settings.OVERLAY_MIN_CONF)
-    parser.add_argument("--topk", type=int, default=3)
+    # Top-K text display removed; only detection boxes are previewed
     args = parser.parse_args()
 
     video_path = settings.VIDEO_PATH
@@ -129,7 +129,7 @@ def main():
         preds = ts.get(i)
         drew_box = False
         if preds:
-            # Draw detection boxes if present
+            # Draw detection boxes if present (no Top-K fallback)
             for p in preds:
                 try:
                     conf = float(p.get("confidence", 0.0))
@@ -150,24 +150,7 @@ def main():
                     if settings.SHOW_BOX_LABELS:
                         label = f"{cls} {conf:.2f}"
                         cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
-
-            # If no boxes, show top-k class labels in top-left
-            if not drew_box:
-                # sort by confidence desc
-                try:
-                    preds_sorted = sorted(preds, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
-                except Exception:
-                    preds_sorted = preds
-                y0 = 30
-                for j, p in enumerate(preds_sorted[: max(1, int(args.topk))]):
-                    cls = str(p.get("class", "action"))
-                    color = _color_from_class(cls)
-                    try:
-                        conf = float(p.get("confidence", 0.0))
-                    except Exception:
-                        conf = 0.0
-                    txt = f"{cls}: {conf:.2f}"
-                    cv2.putText(frame, txt, (15, y0 + j * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+            # If no boxes, do not draw any text
 
         # HUD overlay
         frame = draw_hud(frame, fps, i, total_frames)

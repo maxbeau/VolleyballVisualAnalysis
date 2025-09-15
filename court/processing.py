@@ -6,7 +6,11 @@ from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import cv2
 
-from core.config import settings
+try:
+    # Prefer unified config path
+    from config import settings
+except Exception:  # fallback for older import path
+    from core.config import settings
 from core.utils import ensure_dir
 from court.utils import order_corners, shape_metrics, within_tol
 from court.config import CourtTrackerConfig
@@ -44,11 +48,11 @@ def run_tracking(
 
     # Build tracker with provided cfg if any, otherwise with project-tuned defaults
     tracker_cfg = cfg or CourtTrackerConfig(
-        lk_roi_expand_ratio=settings.LK_ROI_EXPAND_RATIO,
-        max_scale_change_per_frame=settings.MAX_SCALE_CHANGE_PER_FRAME,
-        kf_adaptive_from_template=settings.KF_ADAPTIVE_FROM_TEMPLATE,
-        kf_r_api_min=settings.KF_R_API_MIN,
-        kf_r_api_max=settings.KF_R_API_MAX,
+        lk_roi_expand_ratio=float(getattr(settings.court, "LK_ROI_EXPAND_RATIO", 0.12)),
+        max_scale_change_per_frame=float(getattr(settings.court, "MAX_SCALE_CHANGE_PER_FRAME", 0.10)),
+        kf_adaptive_from_template=bool(getattr(settings.court, "KF_ADAPTIVE_FROM_TEMPLATE", True)),
+        kf_r_api_min=float(getattr(settings.court, "KF_R_API_MIN", 0.8)),
+        kf_r_api_max=float(getattr(settings.court, "KF_R_API_MAX", 2.5)),
         use_homography=use_homography,
         ransac_reproj_thresh=ransac_thresh,
         hold_ttl_frames=hold_ttl,
@@ -167,14 +171,14 @@ def run_tracking(
         cap2 = cv2.VideoCapture(video_path)
         # standard model size; exact px/m not critical for template voting
         model_W, model_H = (1800, 900)
-        orient = decide_court_orientation(cap2, ts_for_orient, (model_W, model_H), mode=settings.COURT_MINI_ORIENT_MODE)
+        orient = decide_court_orientation(cap2, ts_for_orient, (model_W, model_H), mode=getattr(settings.court, "MINI_ORIENT_MODE", "template"))
         cap2.release()
         meta = {
             "tracking_jsonl": tracking_jsonl,
             "orientation": orient,
         }
-        ensure_dir(os.path.dirname(settings.COURT_TRACKING_META) or ".")
-        with open(settings.COURT_TRACKING_META, "w", encoding="utf-8") as mf:
+        ensure_dir(os.path.dirname(getattr(settings.court, "TRACKING_META", tracking_jsonl)) or ".")
+        with open(getattr(settings.court, "TRACKING_META", tracking_jsonl), "w", encoding="utf-8") as mf:
             json.dump(meta, mf, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -182,8 +186,8 @@ def run_tracking(
 
 def main():
     parser = argparse.ArgumentParser(description="Track court corners between low-frequency detections using LK+RANSAC")
-    parser.add_argument("--detections-jsonl", default=settings.COURT_DETECTIONS_JSONL)
-    parser.add_argument("--tracking-jsonl", default=settings.COURT_TRACKING_JSONL)
+    parser.add_argument("--detections-jsonl", default=getattr(settings.court, "DETECTIONS_JSONL"))
+    parser.add_argument("--tracking-jsonl", default=getattr(settings.court, "TRACKING_JSONL"))
     # Model choice
     parser.add_argument("--use-homography", action="store_true", help="Use homography (default). If not set, uses affine.")
     parser.add_argument("--affine", action="store_true", help="Force affine instead of homography")
@@ -268,7 +272,7 @@ def main():
         cfg.feature_max = int(args.feature_max)
     if args.roi_expand_ratio is not None:
         cfg.roi_expand_ratio = float(args.roi_expand_ratio)
-    cfg.lk_roi_expand_ratio = float(args.lk_roi_expand_ratio if args.lk_roi_expand_ratio is not None else settings.LK_ROI_EXPAND_RATIO)
+    cfg.lk_roi_expand_ratio = float(args.lk_roi_expand_ratio if args.lk_roi_expand_ratio is not None else getattr(settings.court, "LK_ROI_EXPAND_RATIO", cfg.lk_roi_expand_ratio))
     if args.reseed_min_tracks is not None:
         cfg.reseed_min_tracks = int(args.reseed_min_tracks)
     if args.subpix_win is not None:
@@ -302,8 +306,8 @@ def main():
         cfg.kalman_r_meas = float(args.kalman_r_meas)
     if args.kf_adaptive_from_template is not None:
         cfg.kf_adaptive_from_template = bool(args.kf_adaptive_from_template)
-    cfg.kf_r_api_min = float(args.kf_r_api_min if args.kf_r_api_min is not None else settings.KF_R_API_MIN)
-    cfg.kf_r_api_max = float(args.kf_r_api_max if args.kf_r_api_max is not None else settings.KF_R_API_MAX)
+    cfg.kf_r_api_min = float(args.kf_r_api_min if args.kf_r_api_min is not None else getattr(settings.court, "KF_R_API_MIN", cfg.kf_r_api_min))
+    cfg.kf_r_api_max = float(args.kf_r_api_max if args.kf_r_api_max is not None else getattr(settings.court, "KF_R_API_MAX", cfg.kf_r_api_max))
     if args.max_scale_change_per_frame is not None:
         cfg.max_scale_change_per_frame = float(args.max_scale_change_per_frame)
     # New performance/robustness options
@@ -327,7 +331,7 @@ def main():
         cfg.motion_md_ref_px = float(args.motion_md_ref_px)
 
     run_tracking(
-        video_path=settings.VIDEO_PATH,
+        video_path=getattr(settings.common, "VIDEO_PATH"),
         detections_jsonl=args.detections_jsonl,
         tracking_jsonl=args.tracking_jsonl,
         use_homography=cfg.use_homography,

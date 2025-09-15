@@ -1,4 +1,7 @@
+import os
+from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from .common import CommonSettings
 
 class BallSettings(BaseSettings):
     """
@@ -7,7 +10,7 @@ class BallSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix='BALL_', env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
     # Detection
-    DETECTIONS_JSONL: str = "outputs/ball_detections.jsonl"
+    DETECTIONS_JSONL: str = "ball_detections.jsonl"
     SAVE_FRAME_JSON: bool = False
     MODEL_ID: str = "volleyball_v2/3"
 
@@ -16,8 +19,9 @@ class BallSettings(BaseSettings):
 
     # Smoothing and Interpolation
     MAX_INTERP_GAP_FRAMES: int = 15
-    HOLD_MODE: bool = True
-    SMOOTHING_ENABLE: bool = True
+    # Default off per request: disable smoothing/hold by default
+    HOLD_MODE: bool = False
+    SMOOTHING_ENABLE: bool = False
     HOLD_TTL_FRAMES: int = 5
 
     # Gating and Gravity
@@ -81,3 +85,8 @@ class BallSettings(BaseSettings):
 
     # Overlay label toggle for near-box tags
     SHOW_NEAR_BOX_TAGS: bool = True  # Show near-box tags like KEPT/FILT
+
+    def __init__(self, **data: Any):
+        super().__init__(**data)
+        base_out = CommonSettings().OUTPUT_DIR
+        self.DETECTIONS_JSONL = os.path.join(base_out, self.DETECTIONS_JSONL)

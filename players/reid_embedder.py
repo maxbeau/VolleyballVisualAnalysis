@@ -75,12 +75,21 @@ class DeepReIDOnnx:
 
 
 def build_reid_embedder(settings) -> Optional[callable]:
-    backend = str(getattr(settings, "PLAYERS_REID_BACKEND", "onnx")).lower()
+    # Prefer nested players settings; fallback to top-level prefixed fields
+    players = getattr(settings, 'players', None)
+    backend = None
+    if players is not None and hasattr(players, 'REID_BACKEND'):
+        backend = str(getattr(players, 'REID_BACKEND', 'onnx')).lower()
+    else:
+        backend = str(getattr(settings, "PLAYERS_REID_BACKEND", "onnx")).lower()
+    if backend == "hist":
+        # Explicitly request simple HSV histogram embedding handled in tracker
+        return None
     if backend == "onnx":
         try:
             emb = DeepReIDOnnx(
-                model_path=getattr(settings, "PLAYERS_REID_ONNX", "weights/osnet_x0_25_msmt17.onnx"),
-                auto_download=bool(getattr(settings, "PLAYERS_REID_AUTO_DOWNLOAD", True)),
+                model_path=(getattr(players, 'REID_ONNX', None) if players is not None else None) or getattr(settings, "PLAYERS_REID_ONNX", "weights/osnet_x0_25_msmt17.onnx"),
+                auto_download=bool((getattr(players, 'REID_AUTO_DOWNLOAD', True) if players is not None else getattr(settings, "PLAYERS_REID_AUTO_DOWNLOAD", True))),
             )
             return emb.embed
         except Exception as e:
@@ -94,7 +103,8 @@ def build_reid_embedder(settings) -> Optional[callable]:
         weights = ResNet50_Weights.IMAGENET1K_V2
         model = resnet50(weights=weights)
         model.fc = torch.nn.Identity()
-        model.eval()
+        device = 'mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu'
+        model.to(device).eval()
         preprocess = weights.transforms()
 
         def _embed(bgr):
@@ -104,7 +114,7 @@ def build_reid_embedder(settings) -> Optional[callable]:
             pil = Image.fromarray(rgb)
             x = preprocess(pil).unsqueeze(0)  # 1x3x224x224
             with torch.no_grad():
-                feat = model(x).cpu().numpy().reshape(-1).astype(np.float32)
+                feat = model(x.to(device)).cpu().numpy().reshape(-1).astype(np.float32)
             n = np.linalg.norm(feat) + 1e-6
             return feat / n
 

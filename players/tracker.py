@@ -80,13 +80,7 @@ class TrackerConfig:
     # Anti-switch guard
     id_lock_age: int = 1              # frames since last hit considered "locked"
     switch_min_sim: float = 0.35      # require at least this ReID sim to switch when locked
-    # Jersey OCR
-    ocr_enable: bool = True
-    ocr_min_conf: float = 0.5
-    ocr_upper_frac: float = 0.6
-    jersey_min_track_conf: float = 0.6
-    # OCR dynamic bonus
-    ocr_bonus_max: float = 0.35
+    # OCR removed
     # Kalman removed for players tracking
 
 
@@ -110,13 +104,10 @@ class Track:
         h = max(1.0, float(y2 - y1))
         self.size_w = w
         self.size_h = h
-        # Jersey number state
-        self.jersey: Optional[str] = None
-        self.jersey_conf: float = 0.0
-        self._jersey_buf: deque = deque([], maxlen=10)
+        # Jersey OCR removed
         # No Kalman state for players
 
-    def update(self, tlbr: Tuple[int, int, int, int], conf: float, emb: Optional[np.ndarray], frame_idx: int, jersey_obs: Optional[Tuple[Optional[str], float]] = None):
+    def update(self, tlbr: Tuple[int, int, int, int], conf: float, emb: Optional[np.ndarray], frame_idx: int):
         self.tlbr = tlbr
         self.conf = conf
         # Update size EMA
@@ -135,28 +126,7 @@ class Track:
                 n = np.linalg.norm(self.emb) + 1e-6
                 self.emb = self.emb / n
             self.embeds.append(emb)
-        # Jersey smoothing buffer
-        if jersey_obs is not None:
-            jtxt, jconf = jersey_obs
-            if jtxt and jconf >= self._cfg.ocr_min_conf:
-                self._jersey_buf.append((str(jtxt), float(jconf)))
-                # vote winner
-                counts: Dict[str, List[float]] = {}
-                for ttxt, c in self._jersey_buf:
-                    counts.setdefault(ttxt, []).append(c)
-                best_txt = None
-                best_score = -1.0
-                for k, vs in counts.items():
-                    score = len(vs) + 0.1 * sum(vs)
-                    if score > best_score:
-                        best_score = score
-                        best_txt = k
-                if best_txt is not None:
-                    conf_avg = float(sum(counts[best_txt]) / len(counts[best_txt]))
-                    # lock-in when seen >=3 times with decent conf
-                    if len(counts[best_txt]) >= 3 and conf_avg >= max(self._cfg.ocr_min_conf, 0.55):
-                        self.jersey = best_txt
-                        self.jersey_conf = conf_avg
+        # OCR removed
         self.age = 0
         self.hits += 1
         self.last_frame = frame_idx
@@ -172,12 +142,12 @@ class ByteTrackReID:
     - Confirms tracks after `min_hits` to reduce flicker.
     """
 
-    def __init__(self, cfg: TrackerConfig, embedder: Optional[Callable[[np.ndarray], np.ndarray]] = None, jersey_ocr: Optional[Callable[[np.ndarray], Tuple[str, float]]] = None):
+    def __init__(self, cfg: TrackerConfig, embedder: Optional[Callable[[np.ndarray], np.ndarray]] = None):
         self.cfg = cfg
         self.tracks: List[Track] = []
         self._next_id = 1
         self.embedder = embedder if embedder is not None else (lambda img: hist_embed(img, cfg.hist_bins_h, cfg.hist_bins_s, cfg.hist_bins_v))
-        self.jersey_ocr = jersey_ocr
+        self.jersey_ocr = None  # OCR removed
 
     def _score(self, track: Track, det_tlbr: Tuple[int, int, int, int], det_emb: Optional[np.ndarray]) -> float:
         # use predicted state (track.tlbr is kept in sync with prediction)
@@ -192,31 +162,7 @@ class ByteTrackReID:
         w = self.cfg.reid_weight
         return (1.0 - w) * iou + w * max(0.0, sim)
 
-    def _ocr_bonus(self, track: Track, jtxt: Optional[str], jconf: float) -> float:
-        """Dynamic OCR bonus based on confidence of detection and track jersey.
-        - Applies only when both sides have jersey and text matches.
-        - Scales bonus by normalized confidences with a cap `ocr_bonus_max`.
-        """
-        try:
-            if not (self.cfg.ocr_enable):
-                return 0.0
-            if not jtxt or jconf is None:
-                return 0.0
-            if not track.jersey or str(track.jersey) != str(jtxt):
-                return 0.0
-            # Require detection OCR above min conf
-            if float(jconf) < float(self.cfg.ocr_min_conf):
-                return 0.0
-            # Normalize confidences to [0,1] from [ocr_min_conf, 1]
-            mn = float(self.cfg.ocr_min_conf)
-            def _norm(c: float) -> float:
-                return max(0.0, min(1.0, (float(c) - mn) / (1.0 - mn + 1e-6)))
-            nd = _norm(float(jconf))
-            nt = _norm(float(getattr(track, 'jersey_conf', 0.0)))
-            strength = math.sqrt(max(0.0, nd * nt))  # conservative combine
-            return min(float(self.cfg.ocr_bonus_max), strength * float(self.cfg.ocr_bonus_max))
-        except Exception:
-            return 0.0
+    # OCR bonus removed
 
     def _size_gate(self, track: Track, det_tlbr: Tuple[int, int, int, int]) -> bool:
         x1, y1, x2, y2 = det_tlbr
@@ -236,8 +182,8 @@ class ByteTrackReID:
 
     def update(self, frame_bgr: np.ndarray, frame_idx: int, detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Split detections into high and low confidence sets
-        high_dets: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray], Optional[str], float]] = []
-        low_dets: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray], Optional[str], float]] = []
+        high_dets: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray]]] = []
+        low_dets: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray]]] = []
         for d in detections:
             try:
                 conf = float(d.get("confidence", 0.0))
@@ -250,30 +196,17 @@ class ByteTrackReID:
             tlbr = xywh_to_tlbr(x, y, w, h)
             crop = crop_safe(frame_bgr, tlbr)
             emb = self.embedder(crop)
-            # jersey OCR (upper torso)
-            jersey_txt: Optional[str] = None
-            jersey_conf: float = 0.0
-            if self.cfg.ocr_enable and self.jersey_ocr is not None:
-                try:
-                    x1, y1, x2, y2 = tlbr
-                    uh = max(1, int(round((y2 - y1) * self.cfg.ocr_upper_frac)))
-                    torso = crop_safe(frame_bgr, (x1, y1, x2, y1 + uh))
-                    jtxt, jconf = self.jersey_ocr(torso)
-                    if jtxt and jconf >= self.cfg.ocr_min_conf:
-                        jersey_txt, jersey_conf = str(jtxt), float(jconf)
-                except Exception:
-                    pass
             if conf >= self.cfg.track_thresh:
-                high_dets.append((tlbr, conf, emb, jersey_txt, jersey_conf))
+                high_dets.append((tlbr, conf, emb))
             elif conf >= self.cfg.low_track_thresh:
-                low_dets.append((tlbr, conf, emb, jersey_txt, jersey_conf))
+                low_dets.append((tlbr, conf, emb))
 
         # Age existing tracks
         for t in self.tracks:
             t.age += 1
             t.active = False
 
-        def _assign(tracks: List[Track], dets: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray], Optional[str], float]]):
+        def _assign(tracks: List[Track], dets: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray]]]):
             if not tracks or not dets:
                 return set(), set(range(len(dets)))
             # Try Hungarian; fallback to greedy
@@ -284,7 +217,7 @@ class ByteTrackReID:
                 M = len(dets)
                 cost = np.full((N, M), 1.0, dtype=np.float32)
                 for i, t in enumerate(tracks):
-                    for j, (tlbr, conf, emb, jtxt, jconf) in enumerate(dets):
+                    for j, (tlbr, conf, emb) in enumerate(dets):
                         iou = iou_tlbr(t.tlbr, tlbr)
                         sim = 0.0 if emb is None else (
                             max(cos_sim(e, emb) for e in t.embeds) if getattr(t, 'embeds', None) else (cos_sim(t.emb, emb) if t.emb is not None else 0.0)
@@ -295,25 +228,19 @@ class ByteTrackReID:
                         if not self._size_gate(t, tlbr):
                             continue
                         # No Kalman gating
-                        # Jersey mismatch gate when both available
-                        if (t.jersey and t.jersey_conf >= self.cfg.jersey_min_track_conf) and (jtxt and jconf >= self.cfg.ocr_min_conf):
-                            if str(t.jersey) != str(jtxt):
-                                continue
                         # Anti-switch guard: for recently confirmed tracks, require stronger evidence to switch
                         if t.age <= self.cfg.id_lock_age:
                             if (sim < self.cfg.switch_min_sim) and (iou < max(0.5, self.cfg.match_iou_thresh)):
                                 continue
                         s = self._score(t, tlbr, emb)
-                        # Dynamic OCR bonus when jersey matches
-                        s = min(1.0, s + self._ocr_bonus(t, jtxt, jconf))
                         cost[i, j] = 1.0 - max(0.0, min(1.0, s))
                 row_ind, col_ind = linear_sum_assignment(cost)
                 matched_t = set()
                 used_d = set()
                 for r, c in zip(row_ind, col_ind):
                     if cost[r, c] <= 0.8:  # allow fairly loose; main gate is IoU
-                        tlbr, conf, emb, jtxt, jconf = dets[c]
-                        tracks[r].update(tlbr, conf, emb, frame_idx, jersey_obs=(jtxt, jconf))
+                        tlbr, conf, emb = dets[c]
+                        tracks[r].update(tlbr, conf, emb, frame_idx)
                         matched_t.add(r)
                         used_d.add(c)
                 unmatched_d = set(range(M)) - used_d
@@ -325,7 +252,7 @@ class ByteTrackReID:
                     best_idx = -1
                     best_score = -1.0
                     for j in list(unmatched):
-                        tlbr, conf, emb, jtxt, jconf = dets[j]
+                        tlbr, conf, emb = dets[j]
                         iou = iou_tlbr(t.tlbr, tlbr)
                         sim = 0.0 if emb is None else (
                             max(cos_sim(e, emb) for e in t.embeds) if getattr(t, 'embeds', None) else (cos_sim(t.emb, emb) if t.emb is not None else 0.0)
@@ -335,20 +262,16 @@ class ByteTrackReID:
                         if not self._size_gate(t, tlbr):
                             continue
                         # No Kalman gating
-                        if (t.jersey and t.jersey_conf >= self.cfg.jersey_min_track_conf) and (jtxt and jconf >= self.cfg.ocr_min_conf):
-                            if str(t.jersey) != str(jtxt):
-                                continue
                         if t.age <= self.cfg.id_lock_age:
                             if (sim < self.cfg.switch_min_sim) and (iou < max(0.5, self.cfg.match_iou_thresh)):
                                 continue
                         s = self._score(t, tlbr, emb)
-                        s = min(1.0, s + self._ocr_bonus(t, jtxt, jconf))
                         if s > best_score:
                             best_score = s
                             best_idx = j
                     if best_idx >= 0:
-                        tlbr, conf, emb, jtxt, jconf = dets[best_idx]
-                        t.update(tlbr, conf, emb, frame_idx, jersey_obs=(jtxt, jconf))
+                        tlbr, conf, emb = dets[best_idx]
+                        t.update(tlbr, conf, emb, frame_idx)
                         unmatched.discard(best_idx)
                 return set(), unmatched
 
@@ -399,8 +322,7 @@ class ByteTrackReID:
                     "height": float(h),
                     "confidence": float(t.conf),
                 }
-                if t.jersey:
-                    row["jersey"] = t.jersey
+                # OCR removed
                 # No Kalman debug fields
                 out.append(row)
         return out

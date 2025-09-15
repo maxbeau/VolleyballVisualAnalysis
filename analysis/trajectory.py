@@ -307,7 +307,7 @@ def analyze(strategy_cli: Optional[str] = None, suffix_cli: str = ""):
     # Draw a bird's-eye path image
     bg = None
     # Prefer previously generated bird's-eye frame if present
-    bird_path = "outputs/court_birdseye.jpg"
+    bird_path = os.path.join(settings.OUTPUT_DIR, "court_birdseye.jpg")
     if os.path.exists(bird_path):
         bg = cv2.imread(bird_path)
     if bg is None:

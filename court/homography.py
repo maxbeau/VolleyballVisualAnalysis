@@ -6,7 +6,10 @@ from typing import Tuple, Optional
 import numpy as np
 import cv2
 
-from core.config import settings
+try:
+    from config import settings
+except Exception:
+    from core.config import settings
 from core.utils import ensure_dir
 from court.utils import (
     median_corners_from_tracking,
@@ -78,9 +81,9 @@ def generate_birdseye_image(
 def main():
     parser = argparse.ArgumentParser(description="Compute and save homography for volleyball court and output a bird's-eye image")
     parser.add_argument("--tracking-jsonl", default=settings.COURT_TRACKING_JSONL)
-    parser.add_argument("--output-h-npy", default="outputs/court_homography.npy")
-    parser.add_argument("--output-h-meta", default="outputs/court_homography.json")
-    parser.add_argument("--birdseye-jpg", default="outputs/court_birdseye.jpg")
+    parser.add_argument("--output-h-npy", default=os.path.join(settings.OUTPUT_DIR, "court_homography.npy"))
+    parser.add_argument("--output-h-meta", default=os.path.join(settings.OUTPUT_DIR, "court_homography.json"))
+    parser.add_argument("--birdseye-jpg", default=os.path.join(settings.OUTPUT_DIR, "court_birdseye.jpg"))
     parser.add_argument("--birdseye-frame", type=int, default=None)
     parser.add_argument("--scale-px-per-meter", type=float, default=100.0)
     parser.add_argument("--model-size", default="", help="Override model size as WxH, e.g. 1800x900")
@@ -117,4 +120,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

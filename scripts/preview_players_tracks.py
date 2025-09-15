@@ -9,7 +9,10 @@ import cv2
 # Ensure project root in path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.config import settings
+try:
+    from config import settings
+except Exception:  # fallback for older path
+    from core.config import settings
 from core.utils import ensure_dir
 from visualization.hud import draw_hud
 import bisect
@@ -76,12 +79,12 @@ def interp_box(a: Dict[str, Any], b: Dict[str, Any], alpha: float) -> Dict[str, 
 
 def main():
     parser = argparse.ArgumentParser(description="Preview players tracks overlay")
-    parser.add_argument("--tracks-jsonl", default=settings.PLAYERS_TRACKS_JSONL)
+    parser.add_argument("--tracks-jsonl", default=settings.players.TRACKS_JSONL)
     parser.add_argument("--out", default=os.path.join("outputs", "players_tracks_preview.mp4"))
-    parser.add_argument("--min-conf", type=float, default=settings.OVERLAY_MIN_CONF)
+    parser.add_argument("--min-conf", type=float, default=settings.common.OVERLAY_MIN_CONF)
     args = parser.parse_args()
 
-    video_path = settings.VIDEO_PATH
+    video_path = settings.common.VIDEO_PATH
     tracks_jsonl = args.tracks_jsonl
     out_path = args.out
     ensure_dir(os.path.dirname(out_path) or ".")
@@ -103,7 +106,7 @@ def main():
 
     out_w = width - (width % 2)
     out_h = height - (height % 2)
-    fourcc = cv2.VideoWriter_fourcc(*settings.OVERLAY_CODEC)
+    fourcc = cv2.VideoWriter_fourcc(*settings.common.OVERLAY_CODEC)
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -138,16 +141,11 @@ def main():
             y = float(t.get("y", 0.0))
             w = float(t.get("width", 0.0))
             h = float(t.get("height", 0.0))
-            jersey = t.get("jersey")
             x1, y1, x2, y2 = to_tlbr_from_xywh(x, y, w, h)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             label = f"P{_id}"
-            if jersey:
-                label += f" #{jersey}"
-            if settings.SHOW_BOX_LABELS:
+            if settings.common.SHOW_BOX_LABELS:
                 label = f"P{_id} {conf:.2f}"
-                if jersey:
-                    label += f" #{jersey}"
             cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
             # (Kalman debug drawing removed)
@@ -177,7 +175,7 @@ def main():
                         x1, y1, x2, y2 = to_tlbr_from_xywh(t["x"], t["y"], t["width"], t["height"])
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
                         label = f"P{tid}"
-                        if settings.SHOW_BOX_LABELS:
+                        if settings.common.SHOW_BOX_LABELS:
                             label += " *"  # mark interpolated
                         cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
                         drawn = True
@@ -188,7 +186,7 @@ def main():
                     x1, y1, x2, y2 = to_tlbr_from_xywh(float(t.get("x", 0.0)), float(t.get("y", 0.0)), float(t.get("width", 0.0)), float(t.get("height", 0.0)))
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
                     label = f"P{tid}"
-                    if settings.SHOW_BOX_LABELS:
+                    if settings.common.SHOW_BOX_LABELS:
                         label += " (hold)"
                     cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 

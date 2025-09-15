@@ -6,7 +6,11 @@ from typing import Dict, Any, Optional, List, Tuple
 import cv2
 
 from core.utils import ensure_dir
-from core.config import settings
+try:
+    # Prefer new unified config path
+    from config import settings
+except Exception:  # fallback for older import path
+    from core.config import settings
 from core.roboflow_client import RoboflowClient
 from court.utils import (
     corners_from_prediction,
@@ -38,7 +42,7 @@ def capture_court(
     ensure_dir(cache_dir)
     ensure_dir(os.path.dirname(combined_jsonl) or ".")
 
-    video_path = settings.VIDEO_PATH
+    video_path = settings.common.VIDEO_PATH
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -48,9 +52,9 @@ def capture_court(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-    if not settings.ROBOFLOW_API_KEY:
+    if not settings.common.ROBOFLOW_API_KEY:
         raise EnvironmentError("ROBOFLOW_API_KEY not found in .env or environment")
-    client = RoboflowClient(api_key=settings.ROBOFLOW_API_KEY)
+    client = RoboflowClient(api_key=settings.common.ROBOFLOW_API_KEY)
 
     step = max(1, int(round(interval_sec * fps)))
     
@@ -130,7 +134,7 @@ def main():
     """Main entry point for the court detection script."""
     parser = argparse.ArgumentParser(description="Capture low-rate court detections to JSONL.")
     parser.add_argument("--model-id", default=os.getenv("COURT_MODEL_ID", "volleyball-court-lurkn/1"))
-    parser.add_argument("--confidence", type=float, default=settings.OVERLAY_MIN_CONF)
+    parser.add_argument("--confidence", type=float, default=settings.common.OVERLAY_MIN_CONF)
     parser.add_argument("--interval-sec", type=float, default=float(os.getenv("COURT_INTERVAL_SEC", 5.0)))
     # Template precision scoring/gating
     parser.add_argument("--use-template-score", dest="use_template_score", action="store_true", default=None, help="Compute template precision score for each detection")
@@ -144,12 +148,12 @@ def main():
         model_id=args.model_id,
         confidence=args.confidence,
         interval_sec=args.interval_sec,
-        cache_dir=os.getenv("COURT_CACHE_DIR", "outputs/court_preds"),
-        combined_jsonl=settings.COURT_DETECTIONS_JSONL,
-        save_jpegs=settings.COURT_SAVE_JPEGS,
-        use_template_score=(settings.COURT_DET_USE_TEMPLATE_SCORE if args.use_template_score is None else bool(args.use_template_score)),
-        template_min_precision=(settings.COURT_DET_MIN_TEMPLATE_PREC if args.template_min_precision is None else float(args.template_min_precision)),
-        template_line_px=(settings.COURT_DET_TEMPLATE_LINE_PX if args.template_line_px is None else int(args.template_line_px)),
+        cache_dir=os.getenv("COURT_CACHE_DIR", os.path.join(settings.common.CACHE_DIR, "court")),
+        combined_jsonl=settings.court.DETECTIONS_JSONL,
+        save_jpegs=settings.court.SAVE_JPEGS,
+        use_template_score=(settings.court.DET_USE_TEMPLATE_SCORE if args.use_template_score is None else bool(args.use_template_score)),
+        template_min_precision=(settings.court.DET_MIN_TEMPLATE_PREC if args.template_min_precision is None else float(args.template_min_precision)),
+        template_line_px=(settings.court.DET_TEMPLATE_LINE_PX if args.template_line_px is None else int(args.template_line_px)),
         gate_by_template=bool(args.gate_by_template),
     )
 

@@ -13,15 +13,18 @@ class CommonSettings(BaseSettings):
     ROBOFLOW_API_KEY: Optional[str] = None
 
     # Input and Cache
-    VIDEO_PATH: str = ""  # Will be dynamically set
+    VIDEO_PATH: str
     INFER_FPS: int = 12
-    CACHE_DIR: str = "outputs/preds"
+    
+    # Dynamic output paths based on video name
+    OUTPUT_DIR: str = ""
+    CACHE_DIR: str = ""
+    BALL_OVERLAY_FULL: str = ""
 
     # Overlay Output
     OVERLAY_MIN_CONF: float = 0.1
     SHOW_BOX_LABELS: bool = False
     OVERLAY_CODEC: str = "avc1"
-    BALL_OVERLAY_FULL: str = "outputs/ball_overlay_full.mp4"
 
     @field_validator("VIDEO_PATH", mode="before")
     @classmethod
@@ -40,3 +43,13 @@ class CommonSettings(BaseSettings):
         raise FileNotFoundError(
             "No video found. Set VIDEO_PATH in .env or place video at data/input.mov or data/input.mp4"
         )
+
+    def __init__(self, **data: Any):
+        super().__init__(**data)
+        if self.VIDEO_PATH:
+            video_name = os.path.splitext(os.path.basename(self.VIDEO_PATH))[0]
+            self.OUTPUT_DIR = f"outputs/{video_name}"
+            self.CACHE_DIR = f"{self.OUTPUT_DIR}/preds"
+            self.BALL_OVERLAY_FULL = f"{self.OUTPUT_DIR}/ball_overlay_full.mp4"
+            os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+            os.makedirs(self.CACHE_DIR, exist_ok=True)

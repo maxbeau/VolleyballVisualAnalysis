@@ -4,9 +4,9 @@ ball
 config
 core
 court
-data
+decision
+input
 outputs
 players
 scripts
 visualization
-weights

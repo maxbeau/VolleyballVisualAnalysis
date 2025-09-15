@@ -16,364 +16,212 @@ Requires-Dist: pydantic-settings
 
 # 🏐 Volleyball Visual Analysis
 
-基于 Roboflow 云推理的排球视频分析工具集：球/球场检测、时序平滑（Kalman+RTS）、可选“重力外推”、检测后处理与视频叠加输出。
+一个基于计算机视觉的排球视频分析工具集，能够自动完成 **目标检测**、**轨迹跟踪** 和 **战术分析**。
+
+本工具通过 [Roboflow](https://roboflow.com/) 的强大模型进行推理，结合卡尔曼滤波、光流法等多种技术，实现了对排球、球员和球场的高精度分析，并能将结果可视化地叠加到原视频中。
 
 ---
 
-## ✨ 功能
-- 检测缓存：按固定 FPS 抽帧调用 Roboflow，将结果保存为逐帧 JSON 与汇总 JSONL
-- 球场角点：低频采集 + Kalman/RTS 时序平滑与插值，输出逐帧角点
-- 时序平滑：前向 Kalman + 反向 RTS 插值、门控与去噪，遮挡段更稳定
-- 重力外推：在预测步注入竖直加速度，使轨迹外推更接近抛物线
-- 软权重过滤：按长宽比对可疑框做置信度衰减，减少误检干扰
-- 叠加可视化：在原视频绘制球框与可选球场边界，输出新视频
-  - 球场方向自适应：四朝向模板打分 + EMA 平滑 + 连胜门槛 + 切换锁定
-  - 中线与三米线：按标准 18×9m 模型投影中线（x=9m）与三米线（x=6m、12m）
+## ✨ 核心功能
 
-### Ball 轨迹构建（新版推荐：Viterbi 全局路径）
-- 全局最优路径（Viterbi/DP）：逐帧必选（候选或 Null），节点代价（置信度/圆度/边缘）+ 边代价（位移/尺寸变化/方向/加速度），避免“静态灯短暂接管”，更稳地跨越遮挡和切换。
-- 关键开关与权重（.env）：
-  - `USE_VITERBI_SELECTION=true`，`VIT_TOPK=5`
-  - 节点：`VIT_W_CONF`，`VIT_W_AR`，`VIT_W_CIRCLE`，`VIT_W_BORDER`，`IMAGE_BORDER_MARGIN_PX`
-  - 边：`VIT_W_DIST`，`VIT_W_SIZE`，`VIT_W_DIR`，`VIT_W_ACCEL`，`VIT_DIR_MAX_DEG`
-  - 空段/重启：`VIT_GAP_PENALTY`，`VIT_START_PENALTY`
-  - 跳变门控：`CONT_MAX_JUMP_PX`
-- 运动学硬门控（可选）：默认关闭，仅保留 Viterbi 的“软约束”；若需要再启用 `KIN_STATIC_FILTER_ENABLE` 等。
- 
+- **多目标检测与跟踪**:
+  - **排球**: 毫秒级精准检测，并利用 Viterbi 算法和卡尔曼滤波生成平滑的运动轨迹。
+  - **球场**: 稳定识别球场边界，并通过单应性变换生成鸟瞰图。
+  - **球员**: 检测场上所有球员，并可进一步进行号码识别或动作分析。
+- **轨迹与物理分析**:
+  - 将像素坐标转换为真实的球场坐标（米）。
+  - 计算球的速度、加速度等物理量。
+- **高度可定制化**:
+  - 所有关键参数均可通过 `.env` 文件配置。
+  - 模块化设计，方便扩展或替换算法。
+- **强大的可视化**:
+  - 将检测框、轨迹线、球场边界等信息实时绘制到视频上。
+  - 支持生成迷你鸟瞰图，直观展示场上动态。
 
 ---
 
-## 📦 环境准备
-- Python 3.9+（推荐 3.10+）
-- 安装依赖：
+## 🚀 快速上手
+
+只需三步，即可完成一次完整的视频分析。
+
+### 1. 环境准备
+
 ```bash
-# 创建并激活虚拟环境
-python3 -m venv .venv && source .venv/bin/activate
+# 克隆项目
+git clone https://github.com/your-repo/VolleyballVisualAnalysis.git
+cd VolleyballVisualAnalysis
 
-# 使用 requirements.txt 安装所有依赖
+# 创建并激活虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 安装依赖
 pip install -r requirements.txt
 ```
-说明：`requirements.txt` 包含 `inference-sdk`, `opencv-python`, `numpy`, `python-dotenv` 等所有必需的库。
 
----
+### 2. 配置环境
 
-## 🔑 配置与路径
-- 在根目录创建/编辑 `.env` 文件以配置项目（如 `ROBOFLOW_API_KEY`）。
-- 所有可调参数均通过 `.env` 文件管理，由 `core/config.py` 统一加载。
-- **视频路径**：如果 `.env` 中未设置 `VIDEO_PATH`，程序会自动查找并使用 `data/input.mov` 或 `data/input.mp4`。
-- 关键路径默认值：
-  - 检测缓存：`outputs/preds/`（JPEG+JSON）
-  - 检测汇总：`outputs/ball_detections.jsonl`
-  - 叠加视频：`outputs/ball_overlay_full.mp4`
-  - 球场跟踪：`outputs/court_tracking.jsonl`
-  
-核心配置分组：
-- 输入与缓存：`VIDEO_PATH`，`INFER_FPS`，`CACHE_DIR`，`COMBINED_JSONL`
-- 叠加输出：`BALL_OVERLAY_FULL`，`OVERLAY_MIN_CONF`，`SHOW_BOX_LABELS`，`OVERLAY_CODEC`
-- 平滑与插值：`MAX_INTERP_GAP_FRAMES`，`HOLD_MODE`，`HOLD_TTL_FRAMES`
-- 门控与重力：`OBS_GATE_CHISQ_THRESH`，`OBS_GATE_USE_CONF`，`GRAVITY_PPS2`
-- 软权重过滤：`FILTER_MIN_ASPECT_RATIO`，`FILTER_MAX_ASPECT_RATIO`，`FILTER_AR_SOFT_ALPHA`
-- 运动学过滤（可选）：`KINEMATIC_FILTER_ENABLE`，`KIN_MAX_SPEED_PX_PER_S`，`KIN_MAX_ACCEL_PX_PER_S2`，`KIN_MAX_DIR_CHANGE_DEG`，`KIN_MAX_SIZE_FRAC_PER_S`
-- 球场叠加：`COURT_OVERLAY`，`COURT_OVERLAY_METHOD(=timeseries)`，`COURT_COLOR`，`COURT_THICKNESS`
-  - 线条颜色扩展：`COURT_CENTER_COLOR`（中线，默认 0,255,255），`COURT_ATTACK_COLOR`（三米线，默认 255,0,255）
+在项目根目录创建一个 `.env` 文件，并填入你的 Roboflow API 密钥。
 
----
+```
+ROBOFLOW_API_KEY="YOUR_ROBOFLOW_API_KEY"
+```
 
-## ▶️ 快速开始
+同时，将你的排球比赛视频命名为 `input.mp4` 并放置在 `data/` 目录下。
 
-1) 视频抽帧检测（仅球模型，内存推理）：
+### 3. 运行完整流程
+
+执行以下命令，一键完成从检测到可视化叠加的全部流程：
+
 ```bash
-python3 scripts/run_ball_detect.py
-```
-说明：
-- 读取 `.env` 的 `ROBOFLOW_API_KEY`，使用模型 `volleyball_v2/3`。
-- 按 `INFER_FPS` 抽帧调用云推理，默认使用“内存推理”（不落盘中间 JPEG/JSON）。
-- 如需保留缓存，可设置：`BALL_SAVE_JPEGS=true`、`BALL_SAVE_FRAME_JSON=true`。
-- 合并输出 `outputs/ball_detections.jsonl`（每行一个帧的预测）。
-
-2) 原始帧完整叠加 + 卡尔曼/RTS 平滑：
-```bash
-python3 scripts/run_overlay.py
-```
-说明：
-- 逐帧读取原视频（保持原始帧率与时长）。
-- 使用 Kalman + RTS 对检测做插值和平滑；相邻观测间隔过大或首尾空窗时，启用“持有最近框（hold）”回退。
-- 支持“长宽比软权重”“运动学过滤（可选）”与“重力外推”提升遮挡段的外推质量。
-- 输出 `outputs/ball_overlay_full.mp4`。
-
-3) 球场追踪（LK+RANSAC + 模板评分 + Kalman，可调 CLI）
-```bash
-python3 -m court.processing \
-  --detections-jsonl outputs/court_detections.jsonl \
-  --tracking-jsonl outputs/court_tracking.jsonl \
-  --use-homography \
-  --ransac-thresh 3.0 \
-  --hold-ttl 8 \
-  --min-inlier-ratio 0.35 --min-inliers 20 \
-  --fb-reproj-thresh 1.2 --max-scale-change-per-frame 0.08 \
-  --feature-max 200 --roi-expand-ratio 0.06 --lk-roi-expand-ratio 0.12 \
-  --reseed-min-tracks 40 --subpix-win 5 \
-  --max-jump-px 8.0 --ratio-tolerance 0.3 --area-tolerance 0.5 \
-  --use-template-score --template-line-px 8 --template-min-precision 0.28 \
-  --use-kalman --kalman-q-pos 1e-2 --kalman-q-vel 5e-2 --kalman-r-meas 2.0 \
-  --kf-adaptive-from-template --kf-r-api-min 0.8 --kf-r-api-max 2.5
-```
-说明：
-- 输入 `--detections-jsonl` 为低频角点关键帧（模型预测/人工修正均可）。
-- 输出逐帧角点到 `--tracking-jsonl`，后续用于稳健单应性估计与鸟瞰图。
-- 未提供的参数默认沿用 `court/config.py` 的数据类默认值与 `core/config.py` 的项目级调参。
-
-关键参数分组：
-- 模型选择：`--use-homography` 或 `--affine`
-- RANSAC 与失败回退：`--ransac-thresh`，`--hold-ttl`，`--min-inlier-ratio`，`--min-inliers`
-- LK 鲁棒：`--fb-reproj-thresh`，`--max-scale-change-per-frame`
-- 特征与 ROI：`--feature-max`，`--roi-expand-ratio`，`--lk-roi-expand-ratio`，`--reseed-min-tracks`，`--subpix-win`
-- 几何门限：`--max-jump-px`，`--ratio-tolerance`，`--area-tolerance`
-- 模板评分：`--use-template-score/--no-template-score`，`--template-line-px`，`--template-min-precision`
-- Kalman：`--use-kalman/--no-kalman`，`--kalman-q-pos`，`--kalman-q-vel`，`--kalman-r-meas`，`--kf-adaptive-from-template`，`--kf-r-api-min`，`--kf-r-api-max`
-
-### 运动学过滤（可选）
-启用后，将在平滑前按图像空间速度/加速度/转向/尺寸变化做硬门控，排除明显不可能为排球的帧。
-
-`.env` 示例参数：
-
-```
-KINEMATIC_FILTER_ENABLE=true
-# 建议根据视频分辨率与 FPS 微调
-KIN_MAX_SPEED_PX_PER_S=2200       # 最大像素速度
-KIN_MAX_ACCEL_PX_PER_S2=18000     # 最大像素加速度
-KIN_MAX_DIR_CHANGE_DEG=135        # 相邻速度向量允许的最大转角
-KIN_MAX_SIZE_FRAC_PER_S=4.0       # 每秒尺寸相对变化上限（宽/高分别检查）
-```
-
-说明：
-- 超过像素速度/加速度上限的帧直接丢弃；
-- 相邻速度向量转角过大（例如>135°）视为不连续，丢弃；
-- 尺寸变化速率过大（透视缩放不应突变）视为假阳性，丢弃；
-- 过滤在 Kalman+RTS 平滑之前生效，避免错误观测干扰轨迹。
-
-4) 场地“采集-处理”解耦与动态跟踪（推荐）：
-
-- 采集（仅云推理与缓存，不做融合）：
-```bash
-python3 scripts/run_court_detect.py
-```
-- 处理（Kalman+RTS 平滑与逐帧插值）：
-```bash
-python3 scripts/run_court_processing.py --detections-jsonl outputs/court_detections.jsonl --tracking-jsonl outputs/court_tracking.jsonl
-```
-说明：
-- 采集阶段专注于按时间间隔抽帧并保存“原始预测+角点”，形成可复用数据资产（JSONL+缓存帧）。
-- 处理阶段对角点做“时间序列平滑与插值”，输出逐帧角点 `outputs/court_tracking.jsonl`，用于真正的“动态跟踪”。
-- 叠加使用 `COURT_OVERLAY_METHOD=timeseries`，按帧读取 `COURT_TRACKING_JSONL` 绘制动态场地。
-- 采集阶段采用内存推理（避免磁盘 I/O）；如需缓存采样帧 JPEG，可在 `.env` 设 `COURT_SAVE_JPEGS=true`。
-
----
-
-## 🏟️ 球场完整流程（Detection → Tracking → Homography）
-
-1) 低频采集关键帧 + 模板打分（可选门控）
-```bash
-python3 scripts/run_court_detect.py --use-template-score
-# 更严格： --gate-by-template --template-min-precision 0.30
-```
-输出：`outputs/court_detections.jsonl`
-
-2) 逐帧跟踪（Balanced 默认）
-```bash
+# 依次执行球检测、球场检测、轨迹分析和视频叠加
+python3 scripts/run_detection.py ball
+python3 scripts/run_detection.py court
 python3 scripts/run_court_processing.py
-python3 scripts/preview_court_tracking.py  # 预览 -> outputs/court_tracking_preview.mp4
-```
-输出：`outputs/court_tracking.jsonl`
-
-3) 导出单应性与鸟瞰图
-```bash
-python3 scripts/run_court_homography.py --tracking-jsonl outputs/court_tracking.jsonl
-```
-输出：
-- `outputs/court_homography.npy` / `outputs/court_homography.json`
-- `outputs/court_birdseye.jpg`
-
-### 预设对比（可复现）
-- Balanced（默认）
-```bash
-python3 scripts/run_court_processing.py \
-  --template-stride 3 --subpix-stride 3 \
-  --use-roi-downsample --roi-downsample-scale 0.5 \
-  --early-motion-gate --early-motion-mad-gray-thr 2.5 \
-  --fallback-affine --kalman-q-scale-from-motion \
-  --kalman-q-scale-lo 1.0 --kalman-q-scale-hi 6.0 --motion-md-ref-px 12.0
-```
-- Energy saver：增大 stride、保留降采样与早停
-- Accuracy：关闭降采样和早停，`--subpix-stride 1`
-
-预览任意时序：
-```bash
-python3 scripts/preview_court_tracking.py --tracking-jsonl <path> --out <video>
-```
-
-### Balanced 关键默认（见 `court/config.py`）
-- `use_roi_downsample=True`, `roi_downsample_scale=0.5`
-- `early_motion_gate=True`, `early_motion_mad_gray_thr=2.5`
-- `template_stride=3`, `subpix_stride=3`
-- `model_fallback_affine_on_fail=True`
-- `kalman_q_scale_from_motion=True`（1.0→6.0，`motion_md_ref_px=12.0`）
-
-## 📁 关键文件
-- `ball/detect.py`：Roboflow 抽帧检测、缓存与 JSONL 汇总
-- `ball/pipeline.py`：Ball 轨迹管线（加载候选 → Viterbi 全局路径 → 可选连续性贪心/确认/回溯）
-- `visualization/overlay.py`：叠加渲染（Viterbi 轨迹、Kalman 可选、软权重、可选场地）
-- `analysis/smoothing.py`：Kalman + RTS 平滑、观测门控与重力注入
-- `court/utils.py`：球场几何工具（角点解析与排序），共用度量 `shape_metrics`、`within_tol`
-- `court/detect.py`：仅采集球场检测结果（抽样帧 JPEG+原始 JSON、合并 JSONL）
-- `court/config.py`：Court 跟踪/门控/模板评分/Kalman 等参数集中管理
-- `court/tracker.py`：LK+RANSAC 单应 + 模板评分 + 几何门控 + Kalman 平滑
-- `court/io.py`：关键帧 JSONL 加载与稳健去极值
-- `court/processing.py`：编排器与 CLI（读取关键帧→LK+RANSAC+Kalman→输出 `court_tracking.jsonl`）
-- `court/smoothing.py`：2D 常速度 Kalman（世界坐标轻量去噪，用于轨迹）
-- `core/roboflow_client.py`：Roboflow SDK 轻封装与网络设置
-- `core/utils.py`：读取 `.env`、保证目录存在、选择视频路径
-- `court/homography.py`：基于时序角点（tracking）计算单应性并生成鸟瞰图
-- `analysis/trajectory.py`：融合球轨迹与单应性，计算世界坐标与物理量
- 
-
----
-
-## ⚠️ 注意事项
-- 云推理成本：抽帧率越高、视频越长 → 成本越高；建议先低 FPS 验证
-- 播放兼容：优先 `avc1`，异常时用 VLC 或切换 `MJPG`/`AVI`
-- 坐标系：像素 y 轴向下为正；重力取正值（向下）
- 
-
----
-
-## ⚙️ 可配置项（节选）
-- 输入与缓存：`VIDEO_PATH`，`INFER_FPS`，`CACHE_DIR`，`COMBINED_JSONL`
-- 叠加输出：`BALL_OVERLAY_FULL`，`OVERLAY_MIN_CONF`，`SHOW_BOX_LABELS`，`OVERLAY_CODEC`
-- 平滑与插值：`MAX_INTERP_GAP_FRAMES`，`HOLD_MODE`，`HOLD_TTL_FRAMES`
-- 门控与重力：`OBS_GATE_CHISQ_THRESH`，`OBS_GATE_USE_CONF`，`GRAVITY_PPS2`
-- 软权重过滤：`FILTER_MIN_ASPECT_RATIO`，`FILTER_MAX_ASPECT_RATIO`，`FILTER_AR_SOFT_ALPHA`
-- 球场叠加：`COURT_OVERLAY`，`COURT_OVERLAY_METHOD(=timeseries)`，`COURT_COLOR`，`COURT_THICKNESS`
-
----
-
-## 🧩 可视化模块与配置
-
-模块结构：
-- `court/orientation.py`：统一“球场方向”判定（horizontal/vertical），支持 template/geometry/force。
-- `visualization/court_overlay.py`：场地渲染器（外边框 + 中线/三米线），内部负责 0/90/180/270 旋转评分、EMA 平滑与迟滞锁定。
-- `visualization/mini_birdseye.py`：迷你鸟瞰渲染（抽象模板 + 可选当前帧小四边形）。
-- `visualization/hud.py`：HUD 工具（FPS/文字气泡）。
-
-可视化相关 .env 开关（新增/关键）：
-- `COURT_TRACKING_META=outputs/court_tracking_meta.json`  # 跟踪流程输出的方向元数据
-- `COURT_MINI_ENABLE=true`                                # 是否在右上角叠加迷你鸟瞰
-- `COURT_MINI_ORIENT_MODE=template`                       # template|geometry|force_horizontal|force_vertical
-- `COURT_MINI_SHOW_LABEL=true`                            # 是否显示 horizontal/vertical 标签
-- `COURT_MINI_PLACEMENT=top-right`                        # 迷你鸟瞰位置：top-right|top-left|bottom-right|bottom-left
-- `COURT_MINI_SCALE=0.24`                                 # 尺度：横向按宽度比例，纵向按高度比例
-- `COURT_MINI_DRAW_POLY=true`                             # 在迷你鸟瞰内绘制当前帧小四边形
-
-示例流程：
-1) 生成跟踪与方向元信息
-```bash
-python3 scripts/run_court_processing.py
-cat outputs/court_tracking_meta.json  # { "orientation": "horizontal" | "vertical" }
-```
-2) 预览可视化（受上述开关影响）
-```bash
-python3 scripts/preview_court_tracking.py --tracking-jsonl outputs/court_tracking.jsonl
-```
-3) 最终叠加（右上角迷你鸟瞰与主场地渲染风格一致）
-```bash
-python3 scripts/run_overlay.py
-```
-
-
----
-
-## 🚀 调参与建议
-- 重力：`GRAVITY_PPS2 ≈ 9.8 * px_per_m`；未知比率可先试 150–250
-- 长宽比：先宽后紧，区间外用 `FILTER_AR_SOFT_ALPHA` 控制衰减强度
-- Viterbi 建议：
-  - 偏保留：降低 `VIT_W_DIST/size` 与 `VIT_GAP_PENALTY`，升高 `VIT_W_CONF`；
-  - 偏严格：升高 `VIT_W_DIST/size/dir/accel` 与 `VIT_GAP_PENALTY`；
-  - 误判多在边缘：适度提高 `VIT_W_BORDER` 或增大 `IMAGE_BORDER_MARGIN_PX`。
-- 插值：`MAX_INTERP_GAP_FRAMES` 控制遮挡段插值长度，过大可能漂移
-
-如需更多定制（ROI 过滤、单应透视、标准场地坐标系等），可在此基础上扩展。
-
----
-
-## 🗺️ 单应性与鸟瞰图（推荐且唯一方案）
-
-仅使用“时序平滑后的角点”（`outputs/court_tracking.jsonl`）来估计稳定的单应性矩阵，并生成球场鸟瞰图：
-
-```bash
-python3 scripts/run_court_homography.py \
-  --tracking-jsonl outputs/court_tracking.jsonl \
-  --output-h-npy outputs/court_homography.npy \
-  --output-h-meta outputs/court_homography.json \
-  --birdseye-jpg outputs/court_birdseye.jpg \
-  --scale-px-per-meter 100  # 可选；默认 100px/m → 1800x900
-```
-
-说明：
-- 读取 `outputs/court_tracking.jsonl` 每帧角点，逐点取中位数，得到鲁棒的 TL,TR,BR,BL 再拟合 H。
-- 将 18m×9m 映射到 `scale_px_per_meter` 对应的画布（默认 1800×900）。
-- 保存单应性：`outputs/court_homography.npy`（3x3）与元数据 JSON。
-- 从原视频取一帧（默认中间帧）透视展开，得到 `outputs/court_birdseye.jpg`。
-- 如需固定像素尺寸，可用 `--model-size 1800x900` 覆盖比例参数。
-
----
-
-## 🧩 球场方向识别与线条渲染（叠加阶段）
-
-- 四朝向模板打分：在模型平面（18×9m）生成模板（外框+中线+两条三米线），对 0/90/180/270° 四种朝向计算模板命中率（投影后命中边缘的比例），择优。
-- 平滑与滞后：首帧直接选最优；后续对分数做 EMA 平滑，仅当候选朝向相对当前朝向优势>5% 且连续≥3 帧时才切换；切换后锁定 10 帧避免来回抖动。
-- 线条渲染：使用最终朝向对应的单应性投影中线（x=9m）与三米线（x=6m、12m），并绘制外框。
-
----
-
-## 🧭 轨迹到标准球场坐标系（连续与物理量）
-
-前置：已完成球场时序角点与单应性估计（上一节）。
-
-将平滑后的球中心映射到标准球场（鸟瞰）坐标系，并输出连续轨迹与速度等物理量：
-
-```bash
 python3 scripts/run_trajectory_analysis.py
+python3 scripts/run_overlay.py
 ```
 
-输出：
-- `outputs/trajectory_world.jsonl`：逐帧世界坐标（像素与米）、速度、累计路程
-- `outputs/trajectory_world.csv`：同上 CSV 版本，便于表格/绘图分析
-- `outputs/trajectory_birdseye.jpg`：在鸟瞰图上绘制的轨迹折线（绿色起点、红色终点）
-
-要点：
-- 先在图像坐标系内用 Kalman+RTS 融合（含可选重力外推/观测门控/hold 回退），再用单应性投影到球场平面；
-- 可选在球场坐标内再次做 2D 时序平滑（常速度模型），使轨迹更连续；
-- 米制换算依据 `court_homography.json` 的 `scale_px_per_meter`，默认 100px/m（18m×9m→1800×900）。
+分析完成后，你将在 `outputs/` 目录下找到最终的叠加视频 `ball_overlay_full.mp4` 以及其他分析数据。
 
 ---
 
-## 🛠️ 球场追踪增强与诊断（本次更新）
+## 📊 工作流程
 
-- 追踪职责划分：
-  - LK/单应负责逐帧估计 `H_prev_curr` 并累积；
-  - Kalman 仅在关键帧融合 API 观测，帧间只做预测（不使用光流角点作为测量）。
-- 模板工具统一：`court/utils.py` 提供模板构建与打分；tracker 与 overlay 共用，降低分叉。
-- 自适应 ROI：基于上一帧位移中位数自适应放大/缩小 LK ROI，提速且稳健。
-- 尺度门控：限制每帧尺度变化（默认 ±8%），异常帧拒绝写入。
-- 自适应测量噪声：关键帧融合 Kalman 时按模板精度自适应测量噪声 R（高质量→更小 R）。
-- 诊断输出：`outputs/court_tracking.jsonl` 每帧写 `info` 指标，`COURT_SHOW_DIAG=true` 可在视频左上角显示关键指标（内点率、重投影误差、条件数、尺度、ROI 比例、模板精度、匹配数等）。
+本项目的数据处理流程如下图所示：
 
-可调环境变量（新增）：
-- `LK_ROI_EXPAND_RATIO`（默认 0.12）
-- `MAX_SCALE_CHANGE_PER_FRAME`（默认 0.08）
-- `KF_ADAPTIVE_FROM_TEMPLATE`（默认 true）
-- `KF_R_API_MIN`（默认 0.8）
-- `KF_R_API_MAX`（默认 2.5）
-- `COURT_SHOW_DIAG`（默认 false）
+```mermaid
+graph TD
+    A[输入视频] --> B{1. 目标检测};
+    B --> C[排球检测结果];
+    B --> D[球场检测结果];
+    B --> E[球员检测结果];
 
-以上均已在 `core/config.py` 读取，`court/processing.py` 注入 tracker。
+    C --> F{2. 轨迹平滑与分析};
+    D --> G{3. 球场跟踪与单应性};
+    
+    F --> H[平滑后的球轨迹];
+    G --> I[逐帧球场角点];
+    I --> J[单应性矩阵];
+    
+    subgraph "4. 数据融合与可视化"
+        H --> K;
+        I --> K;
+        J --> K[视频叠加];
+    end
+    
+    K --> L[输出分析视频];
+    J --> M[鸟瞰图];
+    H --> N[轨迹数据 .csv];
+```
+
+---
+
+## 🛠️ 详细用法
+
+### 检测模块 (`scripts/run_detection.py`)
+
+此脚本用于调用 Roboflow模型 对视频进行目标检测。
+
+- **检测排球**:
+  ```bash
+  python3 scripts/run_detection.py ball
+  ```
+- **检测球场**:
+  ```bash
+  python3 scripts/run_detection.py court
+  ```
+- **检测球员**:
+  ```bash
+  python3 scripts/run_detection.py players
+  ```
+
+#### 球员号码 OCR（可选）
+
+本项目内置了轻量的号码 OCR（基于 EasyOCR），在跟踪阶段对每个球员框的上半身区域做数字识别，并用于提高 ID 稳定性。
+
+- 开启方式：在 `.env` 中加入
+  ```
+  PLAYERS_OCR_ENABLE=true
+  # 仅识别数字，减少误报
+  PLAYERS_OCR_ALLOWLIST=0123456789
+  # 裁剪上半身区域占比（0-1），默认 0.6
+  PLAYERS_OCR_UPPER_FRAC=0.6
+  # 预处理后的目标高度（像素），默认 320
+  PLAYERS_OCR_RESIZE_H=320
+  # 若环境支持 GPU，可设置为 true
+  PLAYERS_OCR_GPU=false
+  # 最小置信度阈值
+  PLAYERS_OCR_MIN_CONF=0.5
+  ```
+
+- 运行跟踪（含 OCR）：
+  ```bash
+  python3 scripts/run_players_track.py
+  ```
+
+- 预览跟踪结果（会在标签中显示 `#号码`）：
+  ```bash
+  python3 scripts/preview_players_tracks.py
+  ```
+
+### 分析与处理模块
+
+- **处理球场数据** (平滑、插值):
+  ```bash
+  python3 scripts/run_court_processing.py
+  ```
+- **计算单应性并生成鸟瞰图**:
+  ```bash
+  python3 scripts/run_court_homography.py
+  ```
+- **分析球的轨迹** (转换为世界坐标):
+  ```bash
+  python3 scripts/run_trajectory_analysis.py
+  ```
+
+### 可视化模块
+
+- **生成最终叠加视频**:
+  ```bash
+  python3 scripts/run_overlay.py
+  ```
+- **预览球场跟踪效果**:
+  ```bash
+  python3 scripts/preview_court_tracking.py
+  ```
+
+---
+
+## ⚙️ 主要配置项
+
+通过修改根目录的 `.env` 文件，你可以调整项目的各项参数。
+
+| 变量名 | 描述 | 默认值 |
+| :--- | :--- | :--- |
+| `ROBOFLOW_API_KEY` | **必需**，你的 Roboflow API 密钥 | `None` |
+| `VIDEO_PATH` | 输入视频的路径 | `data/input.mp4` |
+| `INFER_FPS` | 检测时视频的抽帧率 | `12` |
+| `OVERLAY_MIN_CONF` | 叠加时显示的最小置信度 | `0.1` |
+| `COURT_OVERLAY` | 是否在视频中叠加球场 | `True` |
+| `COURT_MINI_ENABLE`| 是否启用迷你鸟瞰图 | `True` |
+| `ACTIONS_SHOW_BOX` | 是否显示动作检测框（关闭后不显示文本） | `True` |
+| `COURT_MINI_SHOW_TEAMS` | 迷你鸟瞰图是否显示队伍名称（TeamA/TeamB） | `True` |
+
+---
+
+## 📁 项目结构
+
+```
+.
+├── actions/      # 动作分析模块
+├── analysis/     # 轨迹平滑、滤波等核心分析算法
+├── ball/         # 排球检测与轨迹构建管线
+├── config/       # 项目配置文件加载
+├── core/         # 核心工具类（如 Roboflow 客户端）
+├── court/        # 球场检测、跟踪与单应性计算
+├── players/      # 球员检测与跟踪
+├── scripts/      # 可执行脚本（流程入口）
+├── visualization/ # 可视化与视频叠加
+└── outputs/      # 所有输出结果的存放目录
+```
