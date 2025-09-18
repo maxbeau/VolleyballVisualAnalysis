@@ -203,8 +203,17 @@ python3 scripts/run_players_track.py --max-frames 220
 预览跟踪结果：
 
 ```bash
-python3 scripts/preview_players_tracks.py
+ python3 scripts/preview_players_tracks.py
 ```
+
+#### 球员追踪优化技巧
+- 在 `.env` 中调整 `PLAYERS_REID_EXPAND_RATIO` 与 `PLAYERS_REID_FOCUS_TOP`，即可控制 ReID 裁剪区域，更聚焦于上身球衣纹理。
+- `PLAYERS_TRACK_THRESH` / `PLAYERS_MATCH_IOU` / `PLAYERS_REID_MIN_SIM` 组合决定关联严格度，可用 `--track-thresh` 等参数快速试验。
+- `PLAYERS_COURT_MARGIN` 设置球场过滤缓冲区；配合 `PLAYERS_COURT_SOFT_MARGIN`、`PLAYERS_COURT_MIN_KEEP`、`PLAYERS_COURT_FALLBACK_RATIO`、`PLAYERS_COURT_OUTSIDE_BAND_Y` 等参数可调节“软过滤”，防止因单应性误差把真实球员——尤其是发球员或场边的替补——误删。
+- `PLAYERS_MAX_ASPECT_RATIO`/`PLAYERS_ASPECT_BYPASS_CONF` 控制纵向“细长”检测框的过滤阈值，发球员若在画面边缘被拍得很瘦，可提高这些参数避免被误删。
+- 当球员转身出现外观剧变时，可调 `PLAYERS_REID_PROFILE_*` 参数（新增多模板特征），例如调低 `PLAYERS_REID_PROFILE_MERGE_THRESH` 或提高 `PLAYERS_REID_PROFILE_MAX` 以保留正反面特征。
+- `PLAYERS_MIN_BOX_RATIO` 与 `PLAYERS_MAX_ASPECT_RATIO` 用于剔除异常细长/过小框，配合 `PLAYERS_CONF_BONUS_INSIDE_COURT` 可让合法球场内框获得置信度加成。
+- 如果镜头帧率较高，可通过 `--max-age` 或 `PLAYERS_MAX_AGE` 延长允许的丢失帧数，确保跨遮挡仍能保持 ID。
 
 ### 分析与处理模块
 

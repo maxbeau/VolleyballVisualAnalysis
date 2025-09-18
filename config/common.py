@@ -14,7 +14,7 @@ class CommonSettings(BaseSettings):
 
     # Input and Cache
     VIDEO_PATH: str
-    INFER_FPS: int = 12
+    INFER_FPS: int = 6
     
     # Dynamic output paths based on video name
     OUTPUT_DIR: str = ""

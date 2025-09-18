@@ -118,6 +118,11 @@ class MiniBirdseyeOverlay:
                     p1 = poly[k]
                     p2 = poly[(k + 1) % 4]
                     cv2.line(frame, p1, p2, line_color, max(1, int(round(self.thickness * 0.9))))
+                # Draw distinct corner markers to make corners obvious
+                corner_color = self.colors.get("corner", (255, 255, 255))
+                r = max(2, int(round(self.thickness * 1.3)))
+                for p in poly:
+                    cv2.circle(frame, p, r, corner_color, -1, lineType=cv2.LINE_AA)
             except Exception:
                 pass
         # Draw players (projected to bird's-eye) if provided and corners available
@@ -126,9 +131,24 @@ class MiniBirdseyeOverlay:
                 H_img2model, _ = compute_homography(corners, dst_size=model_size)
                 pts_model = apply_homography_points(players_xy, H_img2model)
                 Wm, Hm = model_size
+                # Draw small circle markers
+                radius = max(2, int(round(self.thickness * 1.2)))
+                thickness = max(1, int(round(self.thickness * 0.8)))
                 for (mx, my) in pts_model:
                     sx = int(round(mx * (ov_w - 1) / max(1, (Wm - 1))))
                     sy = int(round(my * (ov_h - 1) / max(1, (Hm - 1))))
+                    cx = x1 + sx
+                    cy = y1 + sy
+                    cv2.circle(frame, (cx, cy), radius, (0, 0, 0), thickness=thickness, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, (cx, cy), max(1, radius - 1), players_color, thickness=-1, lineType=cv2.LINE_AA)
+            except Exception:
+                pass
+        # Fallback: draw normalized image positions if no corners (approximate)
+        elif players_xy:
+            try:
+                for (px, py) in players_xy:
+                    sx = int(round((float(px) / max(1.0, float(Wf - 1))) * (ov_w - 1)))
+                    sy = int(round((float(py) / max(1.0, float(Hf - 1))) * (ov_h - 1)))
                     cx = x1 + sx
                     cy = y1 + sy
                     cv2.circle(frame, (cx, cy), max(2, int(round(self.thickness * 1.2))), players_color, -1, lineType=cv2.LINE_AA)

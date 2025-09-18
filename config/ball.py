@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from .common import CommonSettings
 
@@ -86,7 +87,48 @@ class BallSettings(BaseSettings):
     # Overlay label toggle for near-box tags
     SHOW_NEAR_BOX_TAGS: bool = True  # Show near-box tags like KEPT/FILT
 
+    # Trajectory tail rendering
+    TAIL_ENABLE: bool = True
+    TAIL_MAX_AGE_FRAMES: int = 12  # shorter default trail length
+    TAIL_THICKNESS: int = 2        # line thickness and dot radius
+    TAIL_BASE_ALPHA: float = 0.7   # 0..1, newest segment opacity
+    TAIL_COLOR: tuple = Field(default=(255, 255, 255))  # BGR white
+
     def __init__(self, **data: Any):
         super().__init__(**data)
         base_out = CommonSettings().OUTPUT_DIR
         self.DETECTIONS_JSONL = os.path.join(base_out, self.DETECTIONS_JSONL)
+        # Backward-compatible env fallbacks for trail settings
+        try:
+            import os as _os
+            def _parse_bool(v: Any) -> bool:
+                return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+            def _parse_color(v: str):
+                try:
+                    parts = [int(p.strip()) for p in str(v).split(',')]
+                    if len(parts) == 3:
+                        return (parts[0], parts[1], parts[2])
+                except Exception:
+                    pass
+                return self.TAIL_COLOR
+            v_show = _os.getenv('BALL_SHOW_TRAIL')
+            if v_show is not None:
+                self.TAIL_ENABLE = _parse_bool(v_show)
+            v_len = _os.getenv('BALL_TRAIL_LENGTH')
+            if v_len is not None:
+                try:
+                    self.TAIL_MAX_AGE_FRAMES = int(float(v_len))
+                except Exception:
+                    pass
+            v_fade = _os.getenv('BALL_TRAIL_FADE_FRAMES')
+            if v_fade is not None:
+                try:
+                    # Interpret fade frames as max age if provided
+                    self.TAIL_MAX_AGE_FRAMES = int(float(v_fade))
+                except Exception:
+                    pass
+            v_color = _os.getenv('BALL_TAIL_COLOR')
+            if v_color is not None:
+                self.TAIL_COLOR = _parse_color(v_color)
+        except Exception:
+            pass

@@ -222,6 +222,12 @@ def main():
     color = (0, 255, 0)
     thickness = 2
     show_labels = settings.common.SHOW_BOX_LABELS
+    # Ball tail config
+    tail_enable = bool(getattr(settings.ball, "TAIL_ENABLE", True))
+    tail_max_age = int(getattr(settings.ball, "TAIL_MAX_AGE_FRAMES", 16))
+    tail_thickness = int(getattr(settings.ball, "TAIL_THICKNESS", 2))
+    tail_base_alpha = float(getattr(settings.ball, "TAIL_BASE_ALPHA", 0.7))
+    tail_color = tuple(getattr(settings.ball, "TAIL_COLOR", (255, 250, 250)))
     # Court overlay config
     court_overlay = settings.court.OVERLAY
     court_json = "outputs/court_corners_integrated.json"
@@ -327,11 +333,15 @@ def main():
 
     # Load players tracks (if available)
     players_ts: Optional[Dict[int, List[Dict[str, Any]]]] = None
+    players_frames_sorted: Optional[List[int]] = None
     if players_enable:
         try:
             players_ts = load_players_tracks_by_frame(players_tracks_jsonl)
+            if players_ts:
+                players_frames_sorted = sorted(players_ts.keys())
         except Exception:
             players_ts = None
+            players_frames_sorted = None
 
     # Manual exclude list from env (e.g., "20-33,244,252")
     frames_excluded_list = set(parse_frame_spec(settings.ball.EXCLUDE_FRAMES))
@@ -517,7 +527,7 @@ def main():
                         json.dump({"orientation": mini_orient}, mf, ensure_ascii=False)
             except Exception:
                 pass
-        tpl_colors = {"border": court_color, "center": court_center_color, "attack": court_attack_color}
+        tpl_colors = {"border": court_color, "center": court_center_color, "attack": court_attack_color, "corner": (255, 255, 255)}
         mini = MiniBirdseyeOverlay(
             colors=tpl_colors,
             thickness=court_thickness,
@@ -575,6 +585,8 @@ def main():
     i = 0
     last_court_pts: Optional[List[Tuple[float, float]]] = None
     last_court_info: Optional[Dict[str, Any]] = None
+    # Maintain recent ball centers with timestamps (frame indices)
+    ball_trail: List[Tuple[int, int, int]] = []  # (x, y, frame_idx)
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -612,6 +624,9 @@ def main():
         kept_raw = i in frames_kept
         was_filtered = i in frames_filtered
 
+        # Track current ball center for tail drawing
+        cur_center: Optional[Tuple[int, int]] = None
+
         if smoothing_enable:
             pred = pred_with_kalman_or_hold(frames_with_pred, best, smoothed, i, hold_mode, hold_ttl) if ball_available else None
             if pred is not None:
@@ -621,6 +636,10 @@ def main():
                 x, y, w, h = pred["x"], pred["y"], pred["width"], pred["height"]
                 x1, y1, x2, y2 = to_tlbr_from_xywh(x, y, w, h)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                try:
+                    cur_center = (int(round(float(x))), int(round(float(y))))
+                except Exception:
+                    cur_center = None
                 if show_labels:
                     label = f"{pred.get('class','obj')} {pred.get('confidence', 0):.2f}"
                     if pred.get("_interp"):
@@ -659,6 +678,10 @@ def main():
                     # Draw green (or yellow if below conf) and tag near box
                     if conf_raw >= min_conf:
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), thickness)
+                        try:
+                            cur_center = (int(round(float(x))), int(round(float(y))))
+                        except Exception:
+                            cur_center = None
                         if show_labels:
                             cv2.putText(frame, f"{conf_raw:.2f}", (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,0), 1, cv2.LINE_AA)
                         tag = "KEPT"
@@ -709,12 +732,52 @@ def main():
         if pts is not None and len(pts) == 4:
             frame = court_renderer.draw(frame, pts, last_court_info)
 
+        # Update and draw ball trajectory tail (after court lines so tail stays visible)
+        if tail_enable:
+            # Append current center if available
+            if cur_center is not None:
+                ball_trail.append((cur_center[0], cur_center[1], i))
+            # Prune old points beyond max age
+            if ball_trail:
+                cutoff = i - max(0, tail_max_age)
+                ball_trail = [p for p in ball_trail if p[2] >= cutoff]
+            # Draw fading segments
+            if len(ball_trail) >= 2:
+                # Iterate consecutive pairs
+                for j in range(1, len(ball_trail)):
+                    x0, y0, t0 = ball_trail[j - 1]
+                    x1_, y1_, t1_ = ball_trail[j]
+                    # Compute normalized ages [0..1] (1=newest)
+                    a0 = 1.0 - min(1.0, max(0.0, float(i - t0) / max(1, tail_max_age)))
+                    a1 = 1.0 - min(1.0, max(0.0, float(i - t1_) / max(1, tail_max_age)))
+                    seg_alpha = tail_base_alpha * max(0.0, min(1.0, 0.5 * (a0 + a1)))
+                    # Clamp to valid blending range
+                    if seg_alpha > 1.0:
+                        seg_alpha = 1.0
+                    if seg_alpha <= 0.0:
+                        continue
+                    overlay_img = frame.copy()
+                    cv2.line(overlay_img, (x0, y0), (x1_, y1_), tail_color, max(1, tail_thickness), cv2.LINE_AA)
+                    # Blend this segment with its alpha
+                    cv2.addWeighted(overlay_img, seg_alpha, frame, 1.0 - seg_alpha, 0.0, frame)
+
         # Draw mini bird's-eye if enabled (with projected players if available)
         if mini_enable:
             try:
                 players_xy = None
                 if players_ts is not None:
                     trs_now = players_ts.get(i)
+                    # Hold fallback: search nearest previous frame with non-empty tracks within TTL
+                    if (not trs_now) and players_frames_sorted:
+                        ttl = int(getattr(settings.players, "HOLD_TTL_FRAMES", 8))
+                        pos_pf = bisect.bisect_left(players_frames_sorted, i)
+                        k = pos_pf - 1
+                        while k >= 0 and (i - players_frames_sorted[k]) <= ttl:
+                            cand = players_ts.get(players_frames_sorted[k])
+                            if cand:
+                                trs_now = cand
+                                break
+                            k -= 1
                     if trs_now:
                         # Collect bottom-center points with confidence gate
                         players_xy = []
@@ -749,6 +812,17 @@ def main():
         if settings.players.SHOW_BOX and players_ts is not None:
             try:
                 trs = players_ts.get(i)
+                # Hold fallback: search nearest previous frame with non-empty tracks within TTL
+                if (not trs) and players_frames_sorted:
+                    ttl = int(getattr(settings.players, "HOLD_TTL_FRAMES", 8))
+                    pos_pf = bisect.bisect_left(players_frames_sorted, i)
+                    k = pos_pf - 1
+                    while k >= 0 and (i - players_frames_sorted[k]) <= ttl:
+                        cand = players_ts.get(players_frames_sorted[k])
+                        if cand:
+                            trs = cand
+                            break
+                        k -= 1
                 if trs:
                     p_color = (0, 165, 255)
                     for t in trs:
