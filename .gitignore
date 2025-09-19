@@ -2,6 +2,7 @@
 .env
 
 # Data and Outputs
+/data/
 /input/
 /outputs/
 

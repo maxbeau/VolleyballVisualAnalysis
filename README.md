@@ -230,6 +230,16 @@ python3 scripts/run_players_track.py --max-frames 220
   python3 scripts/run_trajectory_analysis.py
   ```
 
+### 数据导出
+
+- **导出回合摘要与比分时间线**:
+  ```bash
+  python3 scripts/export_rallies.py
+  ```
+  - 输出位置：`outputs/<视频名>/rallies_summary.json`
+  - 内容：视频基础信息、两队比分走势、每个回合的发球/胜负/动作序列与球事件。
+  - 可选参数：使用 `--output /path/to/file.json` 指定自定义输出路径。
+
 ### 可视化模块
 
 - **生成最终叠加视频**:

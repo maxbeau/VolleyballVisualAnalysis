@@ -24,6 +24,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 from decision.cross_validate import CrossValidator
 from decision.state_machine import MatchStateMachine
 from decision.court_binding import bind_teams_for_clips
+from decision.rally_processor import RallyProcessor
 from players.io import load_players_tracks_by_frame
 
 
@@ -541,6 +542,14 @@ def main():
 
     # Build Action HUD manager
     clips_list = action_clips or []
+    clips_by_class: Dict[str, List[Dict[str, Any]]] = {}
+    for clip in clips_list:
+        cls = str(clip.get("class", "")).lower()
+        if not cls:
+            continue
+        clips_by_class.setdefault(cls, []).append(clip)
+    for entries in clips_by_class.values():
+        entries.sort(key=lambda c: (int(c.get("start", 0)), int(c.get("end", 0))))
     # Ensure clips have team_name; if missing, bind by side
     side_to_team_map = bind_teams_for_clips(
         clips=clips_list,
@@ -580,6 +589,23 @@ def main():
         serve_cooldown_frames=int(getattr(settings.teams, "SERVE_COOLDOWN_FRAMES", 20)),
     )
 
+    rally_proc: Optional[RallyProcessor] = None
+    try:
+        rally_proc = RallyProcessor(
+            clips=clips_list,
+            ball_tracks=best_pre_kin,
+            court_timeseries=court_timeseries,
+            fps=fps,
+            teamA=getattr(settings.teams, "TEAM_A_NAME", "TeamA"),
+            teamB=getattr(settings.teams, "TEAM_B_NAME", "TeamB"),
+            side_to_team=side_to_team_map,
+            players_by_frame=players_ts,
+            mapper_dims=(Wm, Hm),
+        )
+    except Exception as exc:
+        print(f"Rally processor unavailable: {exc}")
+        rally_proc = None
+
     # Court renderer maintains its own internal smoothing/hysteresis
 
     i = 0
@@ -587,6 +613,8 @@ def main():
     last_court_info: Optional[Dict[str, Any]] = None
     # Maintain recent ball centers with timestamps (frame indices)
     ball_trail: List[Tuple[int, int, int]] = []  # (x, y, frame_idx)
+    min_action_conf = float(getattr(settings.teams, "ACTION_MIN_CONF", 0.25))
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -602,21 +630,25 @@ def main():
 
         # Decision pipeline: active clips -> cross-validated events -> state machine -> HUD lines
         try:
-            active = {"serve": None, "set": None, "spike": None, "block": None}
-            for cname in list(active.keys()):
-                for c in clips_list:
-                    if c.get("class") == cname and int(c.get("start", -1)) <= i <= int(c.get("end", -1)):
-                        active[cname] = c
+            active: Dict[str, Optional[Dict[str, Any]]] = {"serve": None, "set": None, "spike": None, "block": None}
+            for cname in active.keys():
+                entries = clips_by_class.get(cname, [])
+                for clip in entries:
+                    if int(clip.get("start", -1)) <= i <= int(clip.get("end", -1)):
+                        active[cname] = clip
                         break
-            events = xval.events_for(i, active, min_conf=float(getattr(settings.teams, "ACTION_MIN_CONF", 0.25)))
-            lines = msm.process_frame(i, fps, active, events)
+            events = xval.events_for(i, active, min_conf=min_action_conf)
+
+            ctx = rally_proc.context_for_frame(i) if rally_proc is not None else None
+            lines = msm.process(ctx) if ctx is not None else msm.process_frame(i, fps, active, events)
             if lines:
                 y0 = 48
                 for idx, line in enumerate(lines):
                     y = y0 + idx * 22
                     draw_boxed_text(frame, line, (10, y), color=(255, 255, 255), bg=(0, 0, 0), scale=0.6, thickness=2)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Keep HUD failures non-fatal for rendering
+            print(f"HUD pipeline error at frame {i}: {exc}")
 
         # Prepare raw-frame metadata for drawing near-box markers (no global KEPT/REJECT status HUD)
         raw = best_pre_kin.get(i)
