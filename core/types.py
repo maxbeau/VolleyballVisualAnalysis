@@ -6,6 +6,15 @@ Point = Tuple[float, float]
 
 
 @dataclass
+class VideoInfo:
+    """Container for essential video metadata."""
+    width: int
+    height: int
+    fps: float
+    frame_count: int
+
+
+@dataclass
 class CourtFrame:
     frame: int
     corners: List[Point]
@@ -19,5 +28,5 @@ class CourtMeta:
     extra: Optional[Dict[str, Any]] = None
 
 
-__all__ = ["CourtFrame", "CourtMeta", "Point"]
+__all__ = ["CourtFrame", "CourtMeta", "Point", "VideoInfo"]
 

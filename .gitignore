@@ -1,13 +1,29 @@
 # Environments
 .env
+.venv
+venv/
+env/
 
 # Data and Outputs
 /data/
 /input/
 /outputs/
+/weights/
+/.cache/
 
 # macOS
 .DS_Store
 
 # Python
 __pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE / Editor specific
+.vscode/
+.idea/
+.claude/

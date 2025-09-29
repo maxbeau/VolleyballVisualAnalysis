@@ -1,6 +1,36 @@
 from typing import Any, Dict, List, Tuple
 
 
+def _to_tlbr(det: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    x = float(det.get("x", 0.0))
+    y = float(det.get("y", 0.0))
+    w = float(det.get("width", 0.0))
+    h = float(det.get("height", 0.0))
+    half_w = w * 0.5
+    half_h = h * 0.5
+    return (x - half_w, y - half_h, x + half_w, y + half_h)
+
+
+def _iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
 def refine_detections(
     detections: List[Dict[str, Any]],
     frame_shape: Tuple[int, int],
@@ -45,7 +75,29 @@ def refine_detections(
             det_out = det.copy()
             det_out["confidence"] = float(min(1.0, conf + conf_bonus))
         refined.append(det_out)
-    return refined
+
+    if not refined:
+        return refined
+
+    dup_iou = float(getattr(settings.players, "DET_DUP_IOU", 0.6))
+    dup_iou = max(0.0, min(1.0, dup_iou))
+    if dup_iou <= 0.0:
+        return refined
+
+    refined.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+    kept: List[Dict[str, Any]] = []
+    kept_boxes: List[Tuple[float, float, float, float]] = []
+    for det in refined:
+        box = _to_tlbr(det)
+        should_keep = True
+        for kb in kept_boxes:
+            if _iou(box, kb) >= dup_iou:
+                should_keep = False
+                break
+        if should_keep:
+            kept.append(det)
+            kept_boxes.append(box)
+    return kept
 
 
 __all__ = ["refine_detections"]
