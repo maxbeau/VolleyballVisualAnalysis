@@ -15,9 +15,6 @@ from visualization.overlay_utils import action_color as _action_color
 from court.orientation import decide_orientation as decide_court_orientation
 # from config import settings # Refactored: No longer using global settings
 from core.utils import ensure_dir
-from analysis.smoothing import kalman_rts_smooth
-from analysis.kinematic_filter import filter_by_kinematics
-from analysis.trajectory import load_best_ball_per_frame
 from actions.io import load_actions_by_frame, load_action_clips
 from visualization.action_hud import ActionHud
 import sys as _sys, os as _os
@@ -81,40 +78,30 @@ def _read_court_timeseries(tracking_jsonl: str) -> Tuple[Dict[int, List[Tuple[fl
     return ts, infos
 
 
-def _simple_ball_tracks(
-    jsonl_path: str,
-    min_confidence: float,
-    frame_size: Tuple[int, int],
-    allowed_classes: Optional[List[str]] = None,
-) -> Dict[int, Dict[str, Any]]:
-    """Build a lightweight per-frame ball track map from detections."""
-    allowed = allowed_classes or ["ball", "volleyball"]
-    best = load_best_ball_per_frame(jsonl_path, allowed)
-    width, height = frame_size
+def _load_ball_trajectory(jsonl_path: str) -> Dict[int, Dict[str, Any]]:
+    """Loads the final, smoothed ball trajectory data."""
     tracks: Dict[int, Dict[str, Any]] = {}
-    for frame_idx, pred in best.items():
-        try:
-            conf = float(pred.get("confidence", 0.0))
-            if conf < min_confidence:
-                continue
-            cx = float(pred.get("x", 0.0))
-            cy = float(pred.get("y", 0.0))
-            w = float(pred.get("width", 0.0))
-            h = float(pred.get("height", 0.0))
-            if w <= 0.0 or h <= 0.0:
-                continue
-            x1 = cx - w / 2.0
-            y1 = cy - h / 2.0
-            # Clamp to frame bounds to avoid drawing outside frame
-            x1 = max(0.0, min(x1, max(0.0, width - w)))
-            y1 = max(0.0, min(y1, max(0.0, height - h)))
-            tracks[int(frame_idx)] = {
-                "box": (x1, y1, w, h),
-                "confidence": conf,
-                "raw": pred,
-            }
-        except Exception:
-            continue
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line.strip())
+                    frame_idx = int(record["frame"])
+                    tracks[frame_idx] = {
+                        "box": (
+                            float(record["img_x"]) - float(record["w"]) / 2.0,
+                            float(record["img_y"]) - float(record["h"]) / 2.0,
+                            float(record["w"]),
+                            float(record["h"]),
+                        ),
+                        "confidence": float(record["confidence"]),
+                        "raw": record,
+                    }
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+    except FileNotFoundError:
+        print(f"Warning: Ball trajectory file not found at {jsonl_path}")
+        return {}
     return tracks
 
 
@@ -229,42 +216,6 @@ class ActionHudOverlay:
             pass
 
 
-def pred_with_kalman_or_hold(
-    frames: List[int],
-    best: Dict[int, Dict[str, Any]],
-    smoothed: Dict[int, Dict[str, Any]],
-    i: int,
-    hold_mode: str,
-    hold_ttl: int,
-) -> Optional[Dict[str, Any]]:
-    # Prefer Kalman+RTS smoothed output if available
-    if i in smoothed:
-        return smoothed[i].copy()
-
-    # Otherwise, apply hold fallback based on configuration using raw observations
-    if not frames:
-        return None
-    pos = bisect.bisect_left(frames, i)
-    prev_idx = frames[pos - 1] if pos > 0 else None
-    next_idx = frames[pos] if pos < len(frames) else None
-
-    hold_mode = (hold_mode or "prev").lower()
-    if hold_mode not in ("prev", "next", "both", "none"):
-        hold_mode = "prev"
-
-    # Prefer prev hold
-    if hold_mode in ("prev", "both") and prev_idx is not None:
-        if (i - prev_idx) <= hold_ttl:
-            p = best[prev_idx].copy()
-            p["_hold"] = True
-            return p
-    # Optionally allow next hold (forward)
-    if hold_mode in ("next", "both") and next_idx is not None:
-        if (next_idx - i) <= hold_ttl:
-            p = best[next_idx].copy()
-            p["_hold"] = True
-            return p
-    return None
 
 
 
@@ -273,10 +224,10 @@ def run_overlay(
     *,
     cfg: Dict[str, Any],
     video_path: str,
-    ball_detections_jsonl: str,
+    ball_trajectory_jsonl: str,
     court_tracking_jsonl: str,
-    players_tracks_jsonl: str,
-    actions_detections_jsonl: str,
+    players_tracks_jsonl: Optional[str] = None,
+    actions_detections_jsonl: Optional[str] = None,
     actions_clips_jsonl: str,
     court_tracking_meta_json: str,
 ) -> None:
@@ -286,8 +237,31 @@ def run_overlay(
     
     # --- Load all data ---
     court_ts, court_infos = _read_court_timeseries(court_tracking_jsonl)
-    players_by_frame = load_players_tracks_by_frame(players_tracks_jsonl)
-    actions_by_frame = load_actions_by_frame(actions_detections_jsonl)
+    players_cfg = cfg.get("players", {}) or {}
+    players_enabled = bool(players_cfg.get("enable", True))
+    players_by_frame: Dict[int, List[Dict[str, Any]]] = {}
+    if players_enabled and players_tracks_jsonl:
+        try:
+            players_by_frame = load_players_tracks_by_frame(players_tracks_jsonl)
+        except FileNotFoundError:
+            players_by_frame = {}
+        except Exception:
+            players_by_frame = {}
+    else:
+        players_enabled = False
+
+    actions_cfg = cfg.get("actions", {}) or {}
+    actions_enabled = bool(actions_cfg.get("enable", True))
+    actions_by_frame: Dict[int, List[Dict[str, Any]]] = {}
+    if actions_enabled and actions_detections_jsonl:
+        try:
+            actions_by_frame = load_actions_by_frame(actions_detections_jsonl)
+        except FileNotFoundError:
+            actions_by_frame = {}
+        except Exception:
+            actions_by_frame = {}
+    else:
+        actions_enabled = False
     
     # --- Initialize video streams ---
     cap = cv2.VideoCapture(video_path)
@@ -299,37 +273,7 @@ def run_overlay(
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    min_ball_conf = float(cfg.get("ball", {}).get("min_confidence", 0.2))
-    ball_tracks_raw = _simple_ball_tracks(ball_detections_jsonl, min_ball_conf, (width, height))
-    
-    # --- Apply kinematic filtering to ball detections ---
-    ball_cfg = cfg.get("ball", {}) or {}
-    kinematic_cfg = ball_cfg.get("kinematic_filter", {}) or {}
-    filter_cfg = ball_cfg.get("filter", {}) or {}
-
-    if filter_cfg.get("kinematic_filter_enable", True):
-        print("Applying kinematic filter to ball detections...")
-        ball_tracks = filter_by_kinematics(
-            ball_tracks_raw,
-            fps=fps,
-            max_speed_px_per_s=kinematic_cfg.get("max_speed_px_per_s", 3000.0),
-            max_accel_px_per_s2=kinematic_cfg.get("max_accel_px_per_s2", 6000.0),
-            max_dir_change_deg=kinematic_cfg.get("max_dir_change_deg", 45.0),
-            max_size_change_frac_per_s=kinematic_cfg.get("max_size_change_frac_per_s", 10.0),
-            static_filter_enable=kinematic_cfg.get("static_filter_enable", True),
-            static_min_speed_px_per_s=kinematic_cfg.get("static_min_speed_px_per_s", 20.0),
-            static_min_frames=kinematic_cfg.get("static_min_frames", 4),
-            enable_speed_gate=kinematic_cfg.get("enable_speed_gate", True),
-            enable_accel_gate=kinematic_cfg.get("enable_accel_gate", True),
-            enable_dir_gate=kinematic_cfg.get("enable_dir_gate", True),
-            enable_size_gate=kinematic_cfg.get("enable_size_gate", True),
-            dyn_enable=kinematic_cfg.get("dyn_enable", True),
-            dyn_min_mult=kinematic_cfg.get("dyn_min_mult", 0.5),
-            dyn_max_mult=kinematic_cfg.get("dyn_max_mult", 2.0),
-        )
-        print(f"Kinematic filter complete. Kept {len(ball_tracks)} of {len(ball_tracks_raw)} detections.")
-    else:
-        ball_tracks = ball_tracks_raw
+    ball_tracks = _load_ball_trajectory(ball_trajectory_jsonl)
 
     output_video_path = os.path.join(output_dir, cfg.get("output_video_path", "full_overlay.mp4"))
     fourcc = cv2.VideoWriter_fourcc(*cfg.get("codec", "mp4v"))
@@ -349,18 +293,20 @@ def run_overlay(
             SERVE_COOLDOWN_FRAMES=teams_cfg.get("serve_cooldown_frames", 20),
         )
     )
-    try:
-        action_clips = load_action_clips(actions_clips_jsonl)
-    except Exception:
-        action_clips = None
-    action_hud_core = ActionHud(
-        hud_settings,
-        Wm,
-        Hm,
-        court_timeseries=court_ts,
-        action_clips=action_clips,
-    )
-    action_hud = ActionHudOverlay(action_hud_core)
+    action_hud: Optional[ActionHudOverlay] = None
+    if actions_enabled:
+        try:
+            action_clips = load_action_clips(actions_clips_jsonl)
+        except Exception:
+            action_clips = None
+        action_hud_core = ActionHud(
+            hud_settings,
+            Wm,
+            Hm,
+            court_timeseries=court_ts,
+            action_clips=action_clips,
+        )
+        action_hud = ActionHudOverlay(action_hud_core)
 
     # --- Main processing loop ---
     frame_idx = 0
@@ -383,7 +329,7 @@ def run_overlay(
             cv2.rectangle(frame, tl, br, (0, 255, 0), 2)
 
         # Draw players
-        if frame_idx in players_by_frame:
+        if players_enabled and frame_idx in players_by_frame:
             for player in players_by_frame[frame_idx]:
                 cx = float(player.get('x', 0.0))
                 cy = float(player.get('y', 0.0))
@@ -399,7 +345,7 @@ def run_overlay(
                     draw_boxed_text(frame, f"P{int(track_id)}", (int(x1), int(y1)))
 
         # Draw actions
-        if frame_idx in actions_by_frame:
+        if actions_enabled and frame_idx in actions_by_frame:
             for action in actions_by_frame[frame_idx]:
                 cx = float(action.get('x', 0.0))
                 cy = float(action.get('y', 0.0))
@@ -420,7 +366,8 @@ def run_overlay(
         mini_court.draw(frame, frame_idx, court_ts, players_by_frame, ball_tracks)
         
         # Draw action HUD
-        action_hud.draw(frame, frame_idx, fps)
+        if action_hud is not None:
+            action_hud.draw(frame, frame_idx, fps)
 
         # Draw main HUD (frame count, etc.)
         from .hud import draw_hud

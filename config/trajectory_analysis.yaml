@@ -1,0 +1,39 @@
+# --- Trajectory Analysis Settings ----------------------------------
+trajectory_analysis:
+  # Maximum number of frames to interpolate a missing ball detection.
+  max_interp_gap_frames: 0
+  # Number of frames to hold the last known ball position.
+  hold_ttl_frames: 0
+  # Kinematic gating thresholds to reject implausible detections.
+  max_speed_px_per_frame: 220.0
+  max_accel_px_per_frame2: 800.0
+  speed_reset_frame_gap: 10
+  static_filter_enable: true
+  static_window_frames: 5
+  static_min_motion_px: 20.0
+  continuity_filter_enable: true
+  continuity_window_frames: 6
+  continuity_max_error_px: 140.0
+  continuity_error_growth_px: 6.0
+  ball_diameter_m: 0.215
+  size_model_min_samples: 12
+  measurement_confidence_floor: 0.05
+  viterbi:
+    topk: 5
+    gap_penalty: 10.0
+    start_penalty: 5.0
+    max_jump_px: 100.0
+    w_conf: 1.0
+    w_ar: 2.0
+    w_circle: 0.0
+    w_border: 0.0
+    w_dist: 1.0
+    w_size: 0.5
+    w_dir: 2.0
+    w_accel: 1.0
+    dir_max_deg: 60.0
+    image_border_margin_px: 10.0
+  # --- Output files ---
+  output_jsonl: "ball_trajectory.jsonl"
+  output_csv: "ball_trajectory.csv"
+  output_path_img: "ball_path_birdseye.jpg"

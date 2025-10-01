@@ -1,0 +1,36 @@
+# --- Detection Settings --------------------------------------------
+# Configures the object detection backend and target-specific models.
+detection:
+  # Backend can be 'roboflow' or 'local-yolo'.
+  backend: "roboflow"
+  # --- Cache Policy ---
+  # - cache_first: (Default) Use cache if available, infer missing frames, and update cache.
+  # - cache_only: Only use cache. Fail if cache is missing or incomplete.
+  # - always_infer: Ignore cache and always run inference, overwriting old cache.
+  cache_policy: "cache_first"
+  # Roboflow API key is never stored here. Set ROBOFLOW_API_KEY in your environment or .env file.
+  # Inference FPS for each detection target.
+  infer_fps:
+    court: 3
+    players: 6
+    ball: 12
+    actions: 2
+
+  # --- Model IDs (for Roboflow backend) ---
+  models_roboflow:
+    court: "qiuchangjiance-09bhk/4"
+    players: "players-dataset-fusrb/1"
+    ball: "volleyball_v2/3"
+    actions: "volleyball-actions/4"
+
+  # --- Model Paths (for local-yolo backend) ---
+  models_yolo:
+    # Device to use for local YOLO inference (e.g., 'cpu', '0' for GPU 0, 'mps' for Apple Silicon).
+    device: "auto"
+    # Fallback model if a specific target model is not provided.
+    default_model: "weights/yolov8n.pt"
+    # Target-specific model paths.
+    court: "weights/court_yolov8n.pt"
+    players: "weights/players_yolov8n.pt"
+    ball: "weights/ball_yolov8n.pt"
+    actions: "weights/actions_yolov8n.pt"

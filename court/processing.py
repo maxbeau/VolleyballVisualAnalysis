@@ -7,7 +7,7 @@ import cv2
 
 from core.utils import ensure_dir
 from court.utils import order_corners, shape_metrics, within_tol
-from pipeline.config import CourtConfig
+from orchestration.config import CourtConfig
 from court.tracker import CourtLKTracker  # canonical implementation
 from court.orientation import decide_orientation as decide_court_orientation
 from court.io import load_detections

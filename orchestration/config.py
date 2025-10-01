@@ -1,9 +1,9 @@
 """
-Configuration loader for the Volleyball Visual Analysis pipeline.
+Configuration loader for the Volleyball Visual Analysis orchestration.
 
 This module uses Pydantic V2 to define a typed configuration structure that
-is loaded from and validated against the `pipeline.yaml` file. It provides
-a single, reliable source of truth for all pipeline settings.
+is loaded from and validated against YAML files in the `config/` directory.
+It provides a single, reliable source of truth for all orchestration settings.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ load_dotenv()
 # --- Configuration Models ------------------------------------------
 
 class GlobalConfig(BaseModel):
-    """Global settings for the pipeline."""
+    """Global settings for the orchestration."""
     video_path: Path
     output_dir: Path = Path("outputs")
     cache_dir: Path = Path(".cache")
@@ -29,7 +29,7 @@ class GlobalConfig(BaseModel):
     show_box_labels: bool = True
 
 class StepsConfig(BaseModel):
-    """Switches to enable or disable pipeline stages."""
+    """Switches to enable or disable orchestration stages."""
     detection: bool = True
     court_processing: bool = True
     court_homography: bool = True
@@ -84,7 +84,7 @@ class DetectionConfig(BaseModel):
             if not key_val:
                 raise ValueError(
                     "ROBOFLOW_API_KEY must be provided via environment when using the 'roboflow' backend. "
-                    "Add it to your .env file or export it before running the pipeline."
+                    "Add it to your .env file or export it before running the orchestration."
                 )
         return self
 
@@ -192,6 +192,24 @@ class PlayersTrackingConfig(BaseModel):
         return kwargs
 
 
+class BallViterbiConfig(BaseModel):
+    """Settings for the Viterbi-based ball selection algorithm."""
+    topk: int = 5
+    gap_penalty: float = 10.0
+    start_penalty: float = 5.0
+    max_jump_px: float = 120.0
+    w_conf: float = 1.0
+    w_ar: float = 2.0
+    w_circle: float = 0.0
+    w_border: float = 0.0
+    w_dist: float = 1.0
+    w_size: float = 0.5
+    w_dir: float = 2.0
+    w_accel: float = 1.0
+    dir_max_deg: float = 60.0
+    image_border_margin_px: float = 10.0
+
+
 class TrajectoryConfig(BaseModel):
     """Settings for trajectory analysis."""
 
@@ -205,7 +223,20 @@ class TrajectoryConfig(BaseModel):
     hold_ttl_frames: int = 4
     obs_gate_chisq: float = 9.0
     obs_gate_use_conf: bool = True
-    gravity_pps2: float = 350.0
+    max_speed_px_per_frame: float = Field(280.0, description="Max allowable image-plane speed between detections (px/frame)")
+    max_accel_px_per_frame2: float = Field(800.0, description="Max allowable change in speed per frame (px/frame^2)")
+    speed_reset_frame_gap: int = Field(10, description="Frames after which kinematic gates reset to allow new tracks")
+    static_filter_enable: bool = Field(True, description="Enable rejection of near-static detection clusters")
+    static_window_frames: int = Field(5, description="Frames required before evaluating static filter")
+    static_min_motion_px: float = Field(20.0, description="Minimum displacement across the window to keep detections")
+    continuity_filter_enable: bool = Field(True, description="Reject detections that deviate from recent trajectory continuity")
+    continuity_window_frames: int = Field(6, description="History window (frames) used to estimate trajectory")
+    continuity_max_error_px: float = Field(140.0, description="Maximum allowed deviation from predicted position (pixels)")
+    continuity_error_growth_px: float = Field(6.0, description="Additional error budget per frame of gap beyond the first")
+    ball_diameter_m: float = Field(0.215, description="Approximate real-world diameter of the volleyball (meters)")
+    size_model_min_samples: int = Field(12, description="Minimum samples needed to fit the ground-size regression")
+    measurement_confidence_floor: float = Field(0.05, description="Minimum detection confidence considered for smoothing")
+    viterbi: BallViterbiConfig = Field(default_factory=BallViterbiConfig)
 
     @property
     def max_interp_gap(self) -> int:
@@ -215,40 +246,18 @@ class TrajectoryConfig(BaseModel):
     def hold_ttl(self) -> int:
         return self.hold_ttl_frames
 
+    @property
+    def speed_reset_frames(self) -> int:
+        return max(1, self.speed_reset_frame_gap)
 
-class BallContinuityConfig(BaseModel):
-    """Settings for the continuity-based ball selection algorithm."""
-    max_jump_px: float = 100.0
-    search_topk: int = 3
-    reseed_misses: int = 5
-    reseed_lookahead: int = 5
-    reseed_min_move_px: float = 10.0
-    reseed_min_conf: float = 0.1
-    reseed_max_ar_dev: float = 1.5
-    retro_min_seg_len: int = 3
-    retro_min_seg_move_px: float = 20.0
+    @property
+    def static_window(self) -> int:
+        return max(1, int(self.static_window_frames or 1))
 
-class BallViterbiConfig(BaseModel):
-    """Settings for the Viterbi-based ball selection algorithm."""
-    topk: int = 5
-    gap_penalty: float = 10.0
-    start_penalty: float = 5.0
-    w_conf: float = 1.0
-    w_ar: float = 2.0
-    w_circle: float = 0.0
-    w_border: float = 0.0
-    w_dist: float = 1.0
-    w_size: float = 0.5
-    w_dir: float = 2.0
-    w_accel: float = 1.0
-    dir_max_deg: float = 60.0
-    image_border_margin_px: float = 10.0
+    @property
+    def continuity_window(self) -> int:
+        return max(2, int(self.continuity_window_frames or 2))
 
-class BallSelectionConfig(BaseModel):
-    """Configuration for the ball selection algorithm."""
-    method: Literal["continuity", "viterbi", "best_confidence"] = "continuity"
-    continuity: BallContinuityConfig
-    viterbi: BallViterbiConfig
 
 class BallVizConfig(BaseModel):
     """Visual settings for the ball overlay."""
@@ -259,18 +268,11 @@ class BallVizConfig(BaseModel):
     tail_thickness: int = 2
     tail_base_alpha: float = 0.7
     tail_color: tuple[int, int, int] = (255, 250, 250)
-    show_near_box_tags: bool = True
+
 
 class BallFilterConfig(BaseModel):
-    """Settings for filtering ball detections."""
-    exclude_frames: str = ""
-    min_aspect_ratio: float = 0.5
-    max_aspect_ratio: float = 2.0
-    ar_soft_alpha: float = 3.0
+    """Filtering options for ball detections before rendering."""
     kinematic_filter_enable: bool = False
-
-class KinematicFilterConfig(BaseModel):
-    """Settings for the kinematic (physics-based) filter."""
     max_speed_px_per_s: float = 3000.0
     max_accel_px_per_s2: float = 6000.0
     max_dir_change_deg: float = 45.0
@@ -286,25 +288,12 @@ class KinematicFilterConfig(BaseModel):
     dyn_min_mult: float = 0.5
     dyn_max_mult: float = 2.0
 
-class BallSmoothingConfig(BaseModel):
-    """Settings for ball trajectory smoothing."""
-    enable: bool = False
-    obs_gate_chisq_thresh: float = 9.0
-    obs_gate_use_conf: bool = True
-    gravity_pps2: float = 350.0
-
-class BallEvalConfig(BaseModel):
-    """Settings for ball detection evaluation."""
-    nonball_frames: str = ""
 
 class OverlayBallConfig(BaseModel):
-    """Root configuration for all ball processing in the overlay."""
-    selection: BallSelectionConfig
+    """Root configuration for ball visualization in the overlay."""
+    min_confidence: float = 0.2
+    filter: BallFilterConfig = Field(default_factory=BallFilterConfig)
     visualization: BallVizConfig
-    filter: BallFilterConfig
-    kinematic_filter: KinematicFilterConfig
-    smoothing: BallSmoothingConfig
-    evaluation: BallEvalConfig
 
 class OverlayCourtConfig(BaseModel):
     enable: bool = True
@@ -324,10 +313,12 @@ class OverlayCourtConfig(BaseModel):
     mini_draw_poly: bool = True
 
 class OverlayPlayersConfig(BaseModel):
+    enable: bool = True
     hold_ttl_frames: int = 8
     show_box: bool = True
 
 class OverlayActionsConfig(BaseModel):
+    enable: bool = True
     show_box: bool = True
     clips_jsonl: str = "action_clips.jsonl"
 
@@ -359,30 +350,40 @@ class OverlayConfig(BaseModel):
 
 
 class PipelineConfig(BaseModel):
-    """Root model for the entire pipeline configuration."""
+    """Root model for the entire orchestration configuration."""
     global_settings: GlobalConfig = Field(..., alias='global')
     steps: StepsConfig
-    detection: DetectionConfig
-    court: CourtConfig
-    players: PlayersTrackingConfig
-    trajectory_analysis: TrajectoryConfig
-    overlay: OverlayConfig
+    detection: Optional[DetectionConfig] = None
+    court: Optional[CourtConfig] = None
+    players: Optional[PlayersTrackingConfig] = None
+    trajectory_analysis: Optional[TrajectoryConfig] = None
+    overlay: Optional[OverlayConfig] = None
 
 # --- Loader Function -----------------------------------------------
 
-def load_config(config_path: str | Path = "pipeline.yaml") -> PipelineConfig:
+def load_config(config_dir: str | Path = "config") -> PipelineConfig:
     """
-    Loads, validates, and returns the pipeline configuration from a YAML file.
+    Loads, validates, and returns the orchestration configuration by merging
+    all YAML files in the specified directory.
 
     Args:
-        config_path: The path to the YAML configuration file.
+        config_dir: The path to the configuration directory.
 
     Returns:
         A validated PipelineConfig object.
     """
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_data = yaml.safe_load(f)
-    return PipelineConfig.parse_obj(config_data)
+    config_dir = Path(config_dir)
+    if not config_dir.is_dir():
+        raise FileNotFoundError(f"Configuration directory not found: {config_dir}")
+
+    merged_config = {}
+    for yaml_file in sorted(config_dir.glob("*.yaml")):
+        with open(yaml_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            if data:
+                merged_config.update(data)
+
+    return PipelineConfig.parse_obj(merged_config)
 
 # --- Singleton Instance --------------------------------------------
 
@@ -391,9 +392,9 @@ def load_config(config_path: str | Path = "pipeline.yaml") -> PipelineConfig:
 try:
     settings = load_config()
 except FileNotFoundError:
-    logging.warning("pipeline.yaml not found. Using default settings.")
+    logging.warning("Configuration directory 'config' not found or empty. Using default settings.")
     settings = PipelineConfig.parse_obj({})
 except Exception as e:
-    logging.error(f"Error loading pipeline.yaml: {e}", exc_info=True)
+    logging.error(f"Error loading configuration from 'config' directory: {e}", exc_info=True)
     # Fallback to default settings to allow basic imports to succeed.
     settings = PipelineConfig.parse_obj({})

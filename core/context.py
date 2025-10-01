@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict
 
-from pipeline.config import PipelineConfig, settings
+from orchestration.config import PipelineConfig, settings
 
 
 def _safe_segment(value: str, fallback: str) -> str:

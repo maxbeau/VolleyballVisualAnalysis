@@ -1,0 +1,54 @@
+# --- Court Processing Settings -------------------------------------
+court:
+  core:
+    use_homography: true
+    ransac_reproj_thresh: 3.0
+    hold_ttl_frames: 8
+    min_inlier_ratio: 0.15
+    min_inliers: 12
+    fb_reproj_thresh: 2.5
+    ema_alpha: 0.02
+  features:
+    feature_max: 220
+    roi_expand_ratio: 0.16
+    lk_roi_expand_ratio: 0.12
+    reseed_min_tracks: 60
+    subpix_win: 9
+    subpix_stride: 6
+  gates:
+    max_jump_px: 10.0
+    ratio_tolerance: 0.30
+    area_tolerance: 0.50
+    max_scale_change_per_frame: 0.10
+    use_template_score: true
+    template_line_px: 8
+    template_min_precision: 0.34
+    template_stride: 10
+    early_motion_gate: true
+    early_motion_mad_gray_thr: 3.0
+  kalman:
+    use_kalman: true
+    kalman_q_pos: 1e-2
+    kalman_q_vel: 5e-2
+    kalman_r_meas: 2.0
+    kf_adaptive_from_template: true
+    kf_r_api_min: 0.8
+    kf_r_api_max: 2.5
+    kalman_q_scale_from_motion: true
+    kalman_q_scale_lo: 0.5
+    kalman_q_scale_hi: 3.0
+    motion_md_ref_px: 2.0
+  performance:
+    use_roi_downsample: true
+    roi_downsample_scale: 0.5
+    model_fallback_affine_on_fail: true
+  homography:
+    scale_px_per_meter: 20.0
+    birdseye_frame_index: 100
+    model_width: null
+    model_height: null
+  outputs:
+    output_tracking_jsonl: "court_tracking.jsonl"
+    output_meta_json: "court_meta.json"
+    output_homography_npy: "homography.npy"
+    output_birdseye_jpg: "birdseye.jpg"

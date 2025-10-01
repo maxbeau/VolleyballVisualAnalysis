@@ -1,0 +1,28 @@
+# ===================================================================
+# Unified Pipeline Configuration for Volleyball Visual Analysis
+# ===================================================================
+
+# --- Global Settings -----------------------------------------------
+# Defines input video, output directories, and global behavior.
+global:
+  video_path: "input/input.mp4"
+  output_dir: "outputs"
+  cache_dir: ".cache"  # Caches live under .cache/videos/<video_stem>_<hash>/...
+  # Minimum confidence for an object to be considered in tracking and overlays.
+  min_confidence: 0.2
+  # Whether to show labels on bounding boxes in the final overlay video.
+  show_box_labels: true
+
+
+# --- Pipeline Steps ------------------------------------------------
+# Master switch to enable or disable major stages of the pipeline.
+# The pipeline will run these steps in the correct dependency order.
+steps:
+  detection: false
+  court_processing: false
+  court_homography: false
+  players_tracking: false
+  trajectory_analysis: true
+  overlay: true
+
+

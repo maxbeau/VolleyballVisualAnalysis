@@ -1,5 +1,5 @@
 """
-Step definitions for the main pipeline, refactored into classes.
+Step definitions for the main orchestration, refactored into classes.
 """
 from __future__ import annotations
 import logging
@@ -7,17 +7,21 @@ from typing import Set
 
 from core.cache import detection_cache_dir
 from core.context import PipelineContext
-from core.steps import PipelineStep
+from core.steps import OrchestrationStep
 from court.homography import compute_and_save_homography, generate_birdseye_image
 from court.processing import run_tracking
 from detection.pipeline import DetectionPipeline
 from players.track import TrackerConfig, run_player_tracking
-from analysis.trajectory import run_trajectory_analysis as run_ball_trajectory_analysis
+from ball.ball_trajectory import (
+    run_trajectory_analysis as run_ball_trajectory_analysis,
+    TrajectoryIOConfig,
+    TrajectoryAnalysisConfig,
+)
 from visualization.overlay import run_overlay as run_overlay_processing
 
 
-class DetectionStep(PipelineStep):
-    """A pipeline step that runs object detection for a specific target."""
+class DetectionStep(OrchestrationStep):
+    """An orchestration step that runs object detection for a specific target."""
 
     def __init__(self, context: PipelineContext, target: str):
         super().__init__(context)
@@ -58,7 +62,7 @@ class DetectionStep(PipelineStep):
         self.context.register_artifact(f"{self.target}_detections", output_filename)
 
 
-class CourtProcessingStep(PipelineStep):
+class CourtProcessingStep(OrchestrationStep):
     """Runs court tracking and orientation analysis."""
 
     @property
@@ -88,7 +92,7 @@ class CourtProcessingStep(PipelineStep):
         self.context.register_artifact("court_meta", court_settings.outputs.output_meta_json)
 
 
-class CourtHomographyStep(PipelineStep):
+class CourtHomographyStep(OrchestrationStep):
     """Computes court homography and generates a bird's-eye view image."""
 
     @property
@@ -133,7 +137,7 @@ class CourtHomographyStep(PipelineStep):
         self.context.register_artifact("birdseye_image", court_settings.outputs.output_birdseye_jpg)
 
 
-class PlayersTrackingStep(PipelineStep):
+class PlayersTrackingStep(OrchestrationStep):
     """Runs player tracking."""
 
     @property
@@ -164,7 +168,7 @@ class PlayersTrackingStep(PipelineStep):
         self.context.register_artifact("players_tracks", player_settings.output_tracks_jsonl)
 
 
-class TrajectoryAnalysisStep(PipelineStep):
+class TrajectoryAnalysisStep(OrchestrationStep):
     """Runs ball trajectory analysis."""
 
     @property
@@ -186,7 +190,7 @@ class TrajectoryAnalysisStep(PipelineStep):
         output_csv = self.context.output_dir / traj_settings.output_csv
         output_path_img = self.context.output_dir / traj_settings.output_path_img
 
-        run_ball_trajectory_analysis(
+        io_cfg = TrajectoryIOConfig(
             video_path=str(self.settings.global_settings.video_path.resolve()),
             detections_jsonl=str(detections_jsonl.resolve()),
             homography_npy=str(homography_npy.resolve()),
@@ -195,6 +199,9 @@ class TrajectoryAnalysisStep(PipelineStep):
             output_jsonl=str(output_jsonl.resolve()),
             output_csv=str(output_csv.resolve()),
             output_path_img=str(output_path_img.resolve()),
+        )
+
+        analysis_cfg = TrajectoryAnalysisConfig(
             min_confidence=self.settings.global_settings.min_confidence,
             ar_filter_min=traj_settings.ar_filter_min,
             ar_filter_max=traj_settings.ar_filter_max,
@@ -202,16 +209,31 @@ class TrajectoryAnalysisStep(PipelineStep):
             max_interp_gap=traj_settings.max_interp_gap,
             obs_gate_chisq=traj_settings.obs_gate_chisq,
             obs_gate_use_conf=traj_settings.obs_gate_use_conf,
-            gravity_pps2=traj_settings.gravity_pps2,
             hold_ttl=traj_settings.hold_ttl,
+            max_speed_px_per_frame=traj_settings.max_speed_px_per_frame,
+            max_accel_px_per_frame2=traj_settings.max_accel_px_per_frame2,
+            speed_reset_frame_gap=traj_settings.speed_reset_frames,
+            static_filter_enable=traj_settings.static_filter_enable,
+            static_window_frames=traj_settings.static_window,
+            static_min_motion_px=traj_settings.static_min_motion_px,
+            continuity_filter_enable=traj_settings.continuity_filter_enable,
+            continuity_window_frames=traj_settings.continuity_window,
+            continuity_max_error_px=traj_settings.continuity_max_error_px,
+            continuity_error_growth_px=traj_settings.continuity_error_growth_px,
+            viterbi_cfg=traj_settings.viterbi.model_dump(),
+            ball_diameter_m=traj_settings.ball_diameter_m,
+            size_model_min_samples=traj_settings.size_model_min_samples,
+            measurement_confidence_floor=traj_settings.measurement_confidence_floor,
         )
+
+        run_ball_trajectory_analysis(io_cfg, analysis_cfg)
         
         self.context.register_artifact("ball_trajectory_jsonl", traj_settings.output_jsonl)
         self.context.register_artifact("ball_trajectory_csv", traj_settings.output_csv)
         self.context.register_artifact("ball_path_image", traj_settings.output_path_img)
 
 
-class OverlayStep(PipelineStep):
+class OverlayStep(OrchestrationStep):
     """Generates the final overlay video."""
 
     @property
@@ -220,33 +242,39 @@ class OverlayStep(PipelineStep):
 
     @property
     def dependencies(self) -> Set[str]:
-        return {
-            "detection_ball",
-            "detection_actions",
-            "court_processing",
-            "players_tracking",
-        }
+        deps: Set[str] = {"trajectory_analysis", "court_processing"}
+        if self.settings.overlay.players.enable:
+            deps.add("players_tracking")
+        if self.settings.overlay.actions.enable:
+            deps.add("detection_actions")
+        return deps
 
     def run(self) -> None:
         overlay_settings = self.settings.overlay
         
-        ball_detections_jsonl = self.context.get_artifact_path("ball_detections")
-        actions_detections_jsonl = self.context.get_artifact_path("actions_detections")
+        ball_trajectory_jsonl = self.context.get_artifact_path("ball_trajectory_jsonl")
         court_tracking_jsonl = self.context.get_artifact_path("court_tracking")
         court_tracking_meta_json = self.context.get_artifact_path("court_meta")
-        players_tracks_jsonl = self.context.get_artifact_path("players_tracks")
+
+        players_tracks_jsonl = None
+        if overlay_settings.players.enable:
+            players_tracks_jsonl = self.context.get_artifact_path("players_tracks")
+
+        actions_detections_jsonl = None
+        if overlay_settings.actions.enable:
+            actions_detections_jsonl = self.context.get_artifact_path("actions_detections")
         
         actions_clips_jsonl = self.context.output_dir / overlay_settings.actions.clips_jsonl
 
-        cfg = overlay_settings.dict()
+        cfg = overlay_settings.model_dump()
 
         run_overlay_processing(
             cfg=cfg,
             video_path=str(self.settings.global_settings.video_path.resolve()),
-            ball_detections_jsonl=str(ball_detections_jsonl.resolve()),
+            ball_trajectory_jsonl=str(ball_trajectory_jsonl.resolve()),
             court_tracking_jsonl=str(court_tracking_jsonl.resolve()),
-            players_tracks_jsonl=str(players_tracks_jsonl.resolve()),
-            actions_detections_jsonl=str(actions_detections_jsonl.resolve()),
+            players_tracks_jsonl=str(players_tracks_jsonl.resolve()) if players_tracks_jsonl else None,
+            actions_detections_jsonl=str(actions_detections_jsonl.resolve()) if actions_detections_jsonl else None,
             actions_clips_jsonl=str(actions_clips_jsonl.resolve()),
             court_tracking_meta_json=str(court_tracking_meta_json.resolve()),
         )

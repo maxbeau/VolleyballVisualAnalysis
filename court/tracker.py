@@ -3,7 +3,7 @@ from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 import cv2
 
-from pipeline.config import CourtConfig
+from orchestration.config import CourtConfig
 from court.utils import (
     order_corners,
     apply_homography_points,

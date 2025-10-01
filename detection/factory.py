@@ -14,7 +14,7 @@ _BACKENDS: Dict[str, Type[DetectionBackend]] = {
 }
 
 
-from pipeline.config import settings
+from orchestration.config import settings
 
 def create_detection_backend(target_settings: Dict) -> DetectionBackend:
     """Creates a detection backend based on the global pipeline settings."""

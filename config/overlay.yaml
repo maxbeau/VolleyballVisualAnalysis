@@ -1,0 +1,60 @@
+# --- Overlay Settings ----------------------------------------------
+overlay:
+  output_video_path: "full_overlay.mp4"
+  codec: "mp4v"
+
+  ball:
+    min_confidence: 0.2
+    filter:
+      kinematic_filter_enable: false
+    visualization:
+      hold_mode: true
+      hold_ttl_frames: 4
+      tail_enable: false
+      tail_max_age_frames: 16
+      tail_thickness: 2
+      tail_base_alpha: 0.7
+      tail_color: [255, 250, 250]
+
+  court:
+    enable: true
+    method: "timeseries"
+    color: [255, 255, 255]
+    thickness: 2
+    center_color: [200, 200, 200]
+    attack_color: [200, 200, 200]
+    roi_filter: true
+    show_diag: false
+    mini_enable: true
+    mini_show_teams: true
+    mini_orient_mode: "template"
+    mini_placement: "top-right"
+    mini_scale: 0.24
+    mini_show_label: true
+    mini_draw_poly: true
+
+  players:
+    enable: false
+    hold_ttl_frames: 8
+    show_box: false
+
+  actions:
+    enable: false
+    show_box: false
+    clips_jsonl: "action_clips.jsonl"
+
+  teams:
+    team_a_name: "TeamA"
+    team_b_name: "TeamB"
+    action_min_conf: 0.25
+    serve_cooldown_frames: 20
+    bind_strategy: "earliest"
+    team_a_side: "auto"
+    bind_window_frames: 240
+    bind_block_to_serve: true
+    bind_set_to_receive: true
+    bind_block_oppose_spike: true
+    bind_block_oppose_spike_window_frames: 24
+    bind_block_oppose_set: true
+    bind_block_oppose_set_window_frames: 48
+    bind_rally_max_gap_frames: 600

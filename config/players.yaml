@@ -1,0 +1,18 @@
+# --- Player Tracking Settings (OC-SORT) ----------------------------
+players:
+  # Detection confidence threshold to consider a player for tracking.
+  track_thresh: 0.35
+  # IoU threshold for associating detections with existing tracks.
+  match_iou: 0.8
+  # Maximum number of frames to keep a track alive without a new detection.
+  max_age: 50
+  # Minimum number of hits (associated detections) to consider a track valid.
+  min_hits: 3
+  # Maximum number of frames to process for player tracking. null means no limit.
+  max_frames: null
+  # Number of frames to hold a player box for visualization after it disappears.
+  hold_ttl_frames: 8
+  # Whether to draw player boxes on the overlay.
+  show_box: true
+  # Filename for the output tracks file.
+  output_tracks_jsonl: "players_tracks.jsonl"
