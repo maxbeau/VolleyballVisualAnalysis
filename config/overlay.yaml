@@ -5,6 +5,8 @@ overlay:
 
   ball:
     min_confidence: 0.2
+    color: [0, 255, 0]
+    thickness: 2
     filter:
       kinematic_filter_enable: false
     visualization:
@@ -19,7 +21,7 @@ overlay:
   court:
     enable: true
     method: "timeseries"
-    color: [255, 255, 255]
+    color: [0, 160, 0]
     thickness: 2
     center_color: [200, 200, 200]
     attack_color: [200, 200, 200]
@@ -35,11 +37,14 @@ overlay:
 
   players:
     enable: false
+    color: [255, 0, 0]
+    thickness: 2
     hold_ttl_frames: 8
     show_box: false
 
   actions:
     enable: false
+    thickness: 2
     show_box: false
     clips_jsonl: "action_clips.jsonl"
 

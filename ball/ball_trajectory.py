@@ -35,6 +35,7 @@ class TrajectoryIOConfig:
     output_jsonl: str
     output_csv: str
     output_path_img: str
+    homography_timeseries_jsonl: Optional[str] = None
 
 
 @dataclass
@@ -297,6 +298,29 @@ def run_trajectory_analysis(
     dst_size = (int(H_meta.get("dst_size", {}).get("w", 1800)), int(H_meta.get("dst_size", {}).get("h", 900)))
     px_per_m = float(H_meta.get("scale_px_per_meter", 100.0))
 
+    homography_by_frame: Dict[int, np.ndarray] = {}
+    timeseries_path = io_cfg.homography_timeseries_jsonl
+    if timeseries_path and os.path.exists(timeseries_path):
+        with open(timeseries_path, "r", encoding="utf-8") as ts_f:
+            for line in ts_f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                frame_val = rec.get("frame")
+                H_flat = rec.get("homography")
+                if frame_val is None or not H_flat or len(H_flat) != 9:
+                    continue
+                try:
+                    H_frame = np.array(H_flat, dtype=float).reshape(3, 3)
+                except (ValueError, TypeError):
+                    continue
+                homography_by_frame[int(frame_val)] = H_frame
+
     best = _load_and_select_track(
         io_cfg.detections_jsonl, analysis_cfg.viterbi_cfg, (img_w, img_h),
         analysis_cfg.ar_filter_min, analysis_cfg.ar_filter_max, analysis_cfg.ar_filter_alpha
@@ -329,6 +353,7 @@ def run_trajectory_analysis(
         frames_with_pred,
         best,
         homography=H,
+        homography_by_frame=homography_by_frame or None,
         px_per_m=px_per_m,
         img_w=img_w,
         img_h=img_h,

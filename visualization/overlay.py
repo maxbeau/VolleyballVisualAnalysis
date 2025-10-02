@@ -318,7 +318,10 @@ def run_overlay(
         # Draw court
         if frame_idx in court_ts:
             corners = np.array(court_ts[frame_idx], dtype=np.int32)
-            cv2.polylines(frame, [corners], isClosed=True, color=(255, 255, 255), thickness=2)
+            court_cfg = cfg.get("court", {}) or {}
+            court_color = tuple(court_cfg.get("color", (255, 255, 255)))
+            thickness = int(court_cfg.get("thickness", 2))
+            cv2.polylines(frame, [corners], isClosed=True, color=court_color, thickness=thickness)
 
         # Draw ball
         if frame_idx in ball_tracks:
@@ -326,7 +329,10 @@ def run_overlay(
             x, y, w, h = track['box']
             tl = (int(x), int(y))
             br = (int(x + w), int(y + h))
-            cv2.rectangle(frame, tl, br, (0, 255, 0), 2)
+            ball_cfg = cfg.get("ball", {}) or {}
+            ball_color = tuple(ball_cfg.get("color", (0, 255, 0)))
+            ball_thickness = int(ball_cfg.get("thickness", 2))
+            cv2.rectangle(frame, tl, br, ball_color, ball_thickness)
 
         # Draw players
         if players_enabled and frame_idx in players_by_frame:
@@ -339,7 +345,9 @@ def run_overlay(
                 y1 = cy - h / 2.0
                 x2 = x1 + w
                 y2 = y1 + h
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+                player_color = tuple(players_cfg.get("color", (255, 0, 0)))
+                player_thickness = int(players_cfg.get("thickness", 2))
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), player_color, player_thickness)
                 track_id = player.get('id') or player.get('track_id')
                 if track_id is not None:
                     draw_boxed_text(frame, f"P{int(track_id)}", (int(x1), int(y1)))
@@ -359,7 +367,8 @@ def run_overlay(
                 if label and label.strip().lower() in {"ball", "volleyball"}:
                     continue
                 color = _action_color(label)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                action_thickness = int(actions_cfg.get("thickness", 2))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, action_thickness)
                 draw_boxed_text(frame, label, (x1, y1), color=color)
 
         # Draw mini court

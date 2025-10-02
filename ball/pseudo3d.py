@@ -80,6 +80,7 @@ def run_planar_pipeline(
     detections: Dict[int, Dict[str, Any]],
     *,
     homography: np.ndarray,
+    homography_by_frame: Optional[Dict[int, np.ndarray]] = None,
     px_per_m: float,
     img_w: int,
     img_h: int,
@@ -158,8 +159,23 @@ def run_planar_pipeline(
 
     if img_xy_meas:
         frames_img_sorted = sorted(img_xy_meas.keys())
-        mapped = apply_homography_points([img_xy_meas[f] for f in frames_img_sorted], homography)
-        for frame, (wx, wy) in zip(frames_img_sorted, mapped):
+        mapped_points: Dict[int, Tuple[float, float]] = {}
+
+        if homography_by_frame:
+            for frame in frames_img_sorted:
+                H_frame = homography_by_frame.get(frame)
+                if H_frame is None or np.shape(H_frame) != (3, 3):
+                    H_frame = homography
+                mapped_pt = apply_homography_points([img_xy_meas[frame]], H_frame)[0]
+                mapped_points[frame] = (float(mapped_pt[0]), float(mapped_pt[1]))
+        else:
+            mapped = apply_homography_points([img_xy_meas[f] for f in frames_img_sorted], homography)
+            mapped_points = {
+                frame: (float(pt[0]), float(pt[1])) for frame, pt in zip(frames_img_sorted, mapped)
+            }
+
+        for frame in frames_img_sorted:
+            wx, wy = mapped_points[frame]
             wx = float(wx)
             wy = float(wy)
             world_meas_px[frame] = (wx, wy)
