@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from core.utils import ensure_dir
+from visualization.trajectory_debug import render_segmentation_timeline
 
 from .ball_selection import (
     load_all_ball_candidates,
@@ -17,8 +19,13 @@ from .ball_selection import (
     select_ball_track_viterbi,
     soft_weight_aspect_ratio,
 )
-from .kinematic_filters import filter_ball_tracks
 from .pseudo3d import BallTrajectory2DResult, run_planar_pipeline
+from .trajectory_segmentation import (
+    TrajectoryChangeEvent,
+    TrajectorySegment,
+    TrajectorySegmentationConfig,
+    detect_touch_events,
+)
 
 __all__ = (
     "run_trajectory_analysis",
@@ -35,6 +42,7 @@ class TrajectoryIOConfig:
     output_jsonl: str
     output_csv: str
     output_path_img: str
+    output_segmentation_img: Optional[str]
     homography_timeseries_jsonl: Optional[str] = None
 
 
@@ -62,6 +70,8 @@ class TrajectoryAnalysisConfig:
     ball_diameter_m: float
     size_model_min_samples: int
     measurement_confidence_floor: float
+    height_max_m: float = 3.3
+    segmentation: TrajectorySegmentationConfig = field(default_factory=TrajectorySegmentationConfig)
 
 
 def pred_with_kalman_or_hold(
@@ -164,6 +174,9 @@ def _format_and_export_results(
     trajectory_result: BallTrajectory2DResult,
     fps: float,
     px_per_m: float,
+    touch_events: List[TrajectoryChangeEvent],
+    segments: List[TrajectorySegment],
+    frame_to_segment: Dict[int, int],
 ) -> None:
     """Formats the trajectory data and writes it to JSONL and CSV files."""
     img_preds_full = trajectory_result.img_predictions
@@ -185,16 +198,27 @@ def _format_and_export_results(
         if img_p is None:
             continue
 
+        vx_m, vy_m = trajectory_result.velocities_mps.get(frame, (None, None))
+        speed_val = trajectory_result.speed_mps.get(frame)
+        height_val_m = trajectory_result.world_height_m.get(frame, 0.0)
+        height_val_px = trajectory_result.world_height_px.get(frame, height_val_m * px_per_m)
+        vz_m = trajectory_result.vertical_speed_mps.get(frame)
+        if vz_m is not None:
+            try:
+                vz_m = float(vz_m)
+            except (TypeError, ValueError):
+                vz_m = None
+            else:
+                if not math.isfinite(vz_m):
+                    vz_m = None
+
         world_state = trajectory_result.world_states_m.get(frame)
         if world_state:
             wx_m, wy_m = world_state
             default_px = (wx_m * px_per_m, wy_m * px_per_m)
             wx_px, wy_px = trajectory_result.world_states_px.get(frame, default_px)
-            vx_m, vy_m = trajectory_result.velocities_mps.get(frame, (None, None))
-            vz_m = None
-            wz_m = 0.0
-            wz_px = 0.0
-            speed_val = trajectory_result.speed_mps.get(frame)
+            wz_m = float(height_val_m)
+            wz_px = float(height_val_px)
             dist_cum = trajectory_result.dist_cum_m.get(frame, 0.0)
         elif frame in trajectory_result.world_measurements_px:
             wx_px, wy_px = trajectory_result.world_measurements_px[frame]
@@ -202,9 +226,8 @@ def _format_and_export_results(
                 frame,
                 (float(wx_px / px_per_m), float(wy_px / px_per_m)),
             )
-            vx_m, vy_m, vz_m, speed_val = None, None, None, None
-            wz_m = 0.0
-            wz_px = 0.0
+            wz_m = float(height_val_m)
+            wz_px = float(height_val_px)
             dist_cum = trajectory_result.dist_cum_m.get(frame, 0.0)
         else:
             continue
@@ -226,6 +249,44 @@ def _format_and_export_results(
             "vx_mps": vx_m or "", "vy_mps": vy_m or "", "vz_mps": vz_m or "",
             "speed_mps": speed_val or "", "distance_m_cum": dist_cum,
         }
+
+    events_by_frame = {event.frame: event for event in touch_events}
+    segments_by_id = {segment.segment_id: segment for segment in segments}
+
+    for frame in export_rows:
+        segment_id = frame_to_segment.get(frame)
+        if segment_id is not None:
+            segment = segments_by_id.get(segment_id)
+            export_rows[frame]["segment_id"] = segment_id
+            if segment:
+                export_rows[frame]["segment_valid"] = segment.valid
+                export_rows[frame]["segment_duration_sec"] = segment.duration_sec
+                if frame == segment.start_frame:
+                    export_rows[frame]["segment_is_start"] = True
+                if frame == segment.end_frame:
+                    export_rows[frame]["segment_is_end"] = True
+                if segment.change_frame is not None and frame == segment.end_frame:
+                    export_rows[frame]["segment_change_reason"] = segment.change_reason
+                    export_rows[frame]["segment_change_score"] = segment.change_score
+        event = events_by_frame.get(frame)
+        if event:
+            if segment_id is not None:
+                export_rows[frame].setdefault("segment_id", segment_id)
+            export_rows[frame]["touch_event"] = {
+                "reason": event.reason,
+                "score": round(event.score, 3),
+                "delta_speed": event.delta_speed,
+                "delta_heading_deg": event.delta_heading_deg,
+                "delta_height_m": event.delta_height_m,
+                "prev_speed": event.prev_speed,
+                "next_speed": event.next_speed,
+                "prev_heading_deg": event.prev_heading_deg,
+                "next_heading_deg": event.next_heading_deg,
+                "prev_height_m": event.prev_height_m,
+                "next_height_m": event.next_height_m,
+                "details": dict(event.details),
+                "segment_id": segment_id,
+            }
 
     with open(io_cfg.output_jsonl, "w", encoding="utf-8") as jf:
         for frame in sorted(export_rows.keys()):
@@ -326,20 +387,6 @@ def run_trajectory_analysis(
         analysis_cfg.ar_filter_min, analysis_cfg.ar_filter_max, analysis_cfg.ar_filter_alpha
     )
 
-    filter_args = {
-        "min_confidence": analysis_cfg.min_confidence,
-        "max_speed_px_per_frame": analysis_cfg.max_speed_px_per_frame,
-        "max_accel_px_per_frame2": analysis_cfg.max_accel_px_per_frame2,
-        "speed_reset_frame_gap": analysis_cfg.speed_reset_frame_gap,
-        "static_filter_enable": analysis_cfg.static_filter_enable,
-        "static_window_frames": analysis_cfg.static_window_frames,
-        "static_min_motion_px": analysis_cfg.static_min_motion_px,
-        "continuity_filter_enable": analysis_cfg.continuity_filter_enable,
-        "continuity_window_frames": analysis_cfg.continuity_window_frames,
-        "continuity_max_error_px": analysis_cfg.continuity_max_error_px,
-        "continuity_error_growth_px": analysis_cfg.continuity_error_growth_px,
-    }
-    best, _ = filter_ball_tracks(best, **filter_args)
     frames_with_pred = sorted(best.keys())
 
     planar_args = {
@@ -348,6 +395,7 @@ def run_trajectory_analysis(
         "size_model_min_samples": analysis_cfg.size_model_min_samples,
         "measurement_confidence_floor": analysis_cfg.measurement_confidence_floor,
         "max_interp_gap": analysis_cfg.max_interp_gap,
+        "height_max_m": analysis_cfg.height_max_m,
     }
     trajectory_result = run_planar_pipeline(
         frames_with_pred,
@@ -361,13 +409,51 @@ def run_trajectory_analysis(
         **planar_args,
     )
 
-    best = _apply_observation_gate(
-        best, trajectory_result.img_predictions, analysis_cfg.obs_gate_chisq, analysis_cfg.obs_gate_use_conf
-    )
+    touch_events: List[TrajectoryChangeEvent] = []
+    segments: List[TrajectorySegment] = []
+    frame_to_segment: Dict[int, int] = {}
+    if analysis_cfg.segmentation.enable:
+        touch_events, segments, frame_to_segment = detect_touch_events(
+            trajectory_result,
+            fps=fps,
+            cfg=analysis_cfg.segmentation,
+        )
 
-    _format_and_export_results(io_cfg, analysis_cfg, best, trajectory_result, fps, px_per_m)
+    _format_and_export_results(
+        io_cfg,
+        analysis_cfg,
+        best,
+        trajectory_result,
+        fps,
+        px_per_m,
+        touch_events,
+        segments,
+        frame_to_segment,
+    )
     _draw_path_on_birdseye(io_cfg.output_path_img, io_cfg.birdseye_jpg, dst_size, trajectory_result)
+
+    timeline_rendered = False
+    if io_cfg.output_segmentation_img:
+        timeline_rendered = render_segmentation_timeline(
+            io_cfg.output_segmentation_img,
+            trajectory_result,
+            fps,
+            touch_events,
+            segments,
+            analysis_cfg.segmentation,
+        )
+
+    if touch_events:
+        print("Detected trajectory change events:")
+        for event in touch_events:
+            reason = event.reason
+            print(
+                f"  frame {event.frame}: {reason}"
+                f" (score={event.score:.2f})"
+            )
 
     print(f"Trajectory JSONL: {io_cfg.output_jsonl}")
     print(f"Trajectory CSV:   {io_cfg.output_csv}")
     print(f"Bird's-eye path:  {io_cfg.output_path_img}")
+    if timeline_rendered:
+        print(f"Segments timeline: {io_cfg.output_segmentation_img}")

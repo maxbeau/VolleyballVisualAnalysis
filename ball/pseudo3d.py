@@ -73,6 +73,9 @@ class BallTrajectory2DResult:
     velocities_mps: Dict[int, Tuple[float, float]]
     speed_mps: Dict[int, float]
     dist_cum_m: Dict[int, float]
+    world_height_m: Dict[int, float]
+    world_height_px: Dict[int, float]
+    vertical_speed_mps: Dict[int, float]
 
 
 def run_planar_pipeline(
@@ -90,6 +93,7 @@ def run_planar_pipeline(
     size_model_min_samples: int,
     measurement_confidence_floor: float,
     max_interp_gap: int,
+    height_max_m: float,
 ) -> BallTrajectory2DResult:
     """Estimate planar trajectory information and synthetic predictions."""
     img_predictions: Dict[int, Dict[str, Any]] = {}
@@ -102,6 +106,9 @@ def run_planar_pipeline(
     world_meas_m: Dict[int, Tuple[float, float]] = {}
     measurement_confs: Dict[int, float] = {}
     measurement_flags: Dict[int, bool] = {}
+    world_height_m: Dict[int, float] = {}
+    world_height_px: Dict[int, float] = {}
+    vertical_speed_mps: Dict[int, float] = {}
 
     if not frames_with_pred:
         return BallTrajectory2DResult(
@@ -115,6 +122,9 @@ def run_planar_pipeline(
             velocities_mps,
             speed_mps,
             dist_cum_m,
+            world_height_m,
+            world_height_px,
+            vertical_speed_mps,
         )
 
     default_ground_px = 24.0
@@ -123,6 +133,7 @@ def run_planar_pipeline(
     size_model = GroundSizeModel(None, default_ground_px)
     size_samples: List[Tuple[float, float, float, float]] = []
     size_px_by_frame: Dict[int, float] = {}
+    ground_size_by_frame: Dict[int, float] = {}
 
     for frame in frames_with_pred:
         prediction = detections[frame]
@@ -156,6 +167,63 @@ def run_planar_pipeline(
             y_val / max(1, img_h or 1),
         )
         detections[frame]["_ground_size_px"] = ground_size
+        ground_size_by_frame[frame] = ground_size
+
+    height_ratio_by_frame: Dict[int, float] = {}
+    if ground_size_by_frame and size_px_by_frame:
+        for frame, ground_size in ground_size_by_frame.items():
+            size_px = size_px_by_frame.get(frame)
+            if not size_px or size_px <= 1e-3:
+                continue
+            ratio = float(ground_size / size_px)
+            if not math.isfinite(ratio):
+                continue
+            ratio = max(0.25, min(5.0, ratio))
+            height_ratio_by_frame[frame] = ratio
+
+    ratio_candidates = [ratio for ratio in height_ratio_by_frame.values() if ratio > 1.02]
+    ratio_high = float(np.percentile(ratio_candidates, 90)) if ratio_candidates else 1.05
+    ratio_high = max(ratio_high, 1.05)
+    ratio_denom = max(1e-6, ratio_high - 1.0)
+
+    height_max_m = max(0.1, float(height_max_m if height_max_m is not None else 3.0))
+    height_proxy_m: Dict[int, float] = {}
+    for frame, ratio in height_ratio_by_frame.items():
+        if ratio <= 1.02:
+            height_proxy_m[frame] = 0.0
+            continue
+        norm = (ratio - 1.0) / ratio_denom
+        norm = max(0.0, min(1.2, norm))
+        height_proxy_m[frame] = float(height_max_m * min(1.0, norm))
+
+    if height_proxy_m:
+        height_smoothed: Dict[int, float] = {}
+        prev_frame: Optional[int] = None
+        prev_val: Optional[float] = None
+        smoothing_alpha = 0.65
+        for frame in frames_with_pred:
+            raw_val = float(height_proxy_m.get(frame, 0.0))
+            if prev_val is None or prev_frame is None or (frame - prev_frame) > max(1, max_interp_gap):
+                smoothed_val = raw_val
+            else:
+                smoothed_val = smoothing_alpha * raw_val + (1.0 - smoothing_alpha) * prev_val
+            height_smoothed[frame] = smoothed_val
+            prev_val = smoothed_val
+            prev_frame = frame
+
+        frames_idx = {frame: idx for idx, frame in enumerate(frames_with_pred)}
+        for frame in frames_with_pred:
+            idx = frames_idx[frame]
+            window_vals = []
+            for offset in (-1, 0, 1):
+                neighbour_idx = idx + offset
+                if 0 <= neighbour_idx < len(frames_with_pred):
+                    neighbour_frame = frames_with_pred[neighbour_idx]
+                    window_vals.append(height_smoothed.get(neighbour_frame, 0.0))
+            if window_vals:
+                height_smoothed[frame] = float(np.median(window_vals))
+
+        height_proxy_m = height_smoothed
 
     if img_xy_meas:
         frames_img_sorted = sorted(img_xy_meas.keys())
@@ -183,6 +251,9 @@ def run_planar_pipeline(
                 float(wx / px_per_m) if px_per_m else float(wx),
                 float(wy / px_per_m) if px_per_m else float(wy),
             )
+            height_val = float(height_proxy_m.get(frame, 0.0))
+            world_height_m[frame] = height_val
+            world_height_px[frame] = float(height_val * px_per_m) if px_per_m else height_val
 
     for frame in frames_with_pred:
         measurement_flags.setdefault(frame, frame in world_meas_m)
@@ -192,11 +263,13 @@ def run_planar_pipeline(
         cum_dist = 0.0
         prev_pos: Optional[Tuple[float, float]] = None
         prev_frame: Optional[int] = None
+        prev_height: Optional[float] = None
         fps_safe = fps if fps and fps > 0 else None
 
         for frame in frames_meas_sorted:
             wx_m, wy_m = world_meas_m[frame]
             wx_px, wy_px = world_meas_px[frame]
+            curr_height = world_height_m.get(frame, 0.0)
 
             world_states_m[frame] = (wx_m, wy_m)
             world_states_px[frame] = (wx_px, wy_px)
@@ -213,6 +286,10 @@ def run_planar_pipeline(
                         vx_m = (wx_m - prev_pos[0]) / dt
                         vy_m = (wy_m - prev_pos[1]) / dt
                         has_velocity = True
+                        if prev_height is not None:
+                            vz = (curr_height - prev_height) / dt
+                            if math.isfinite(vz):
+                                vertical_speed_mps[frame] = float(vz)
             dist_cum_m[frame] = cum_dist
 
             if prev_pos is not None and prev_frame is not None and fps_safe and has_velocity:
@@ -224,6 +301,8 @@ def run_planar_pipeline(
 
             prev_pos = (wx_m, wy_m)
             prev_frame = frame
+            prev_height = curr_height
+            vertical_speed_mps.setdefault(frame, 0.0)
 
     return BallTrajectory2DResult(
         img_predictions,
@@ -236,6 +315,9 @@ def run_planar_pipeline(
         velocities_mps,
         speed_mps,
         dist_cum_m,
+        world_height_m,
+        world_height_px,
+        vertical_speed_mps,
     )
 
 

@@ -5,8 +5,6 @@ overlay:
 
   ball:
     min_confidence: 0.2
-    color: [0, 255, 0]
-    thickness: 2
     filter:
       kinematic_filter_enable: false
     visualization:
@@ -17,6 +15,26 @@ overlay:
       tail_thickness: 2
       tail_base_alpha: 0.7
       tail_color: [255, 250, 250]
+    segmentation_viz:
+      enable: true
+      tail_length_frames: 36
+      tail_thickness: 3
+      event_marker_radius: 12
+      event_marker_color: [255, 255, 255]
+      label_color: [240, 240, 240]
+      label_bg: [10, 10, 10]
+      label_scale: 0.55
+      palette:
+        - [244, 67, 54]
+        - [0, 188, 212]
+        - [76, 175, 80]
+        - [255, 235, 59]
+        - [156, 39, 176]
+        - [33, 150, 243]
+        - [255, 152, 0]
+        - [121, 85, 72]
+        - [205, 220, 57]
+        - [63, 81, 181]
 
   court:
     enable: true

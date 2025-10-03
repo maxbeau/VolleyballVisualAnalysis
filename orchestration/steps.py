@@ -17,6 +17,7 @@ from ball.ball_trajectory import (
     TrajectoryIOConfig,
     TrajectoryAnalysisConfig,
 )
+from ball.trajectory_segmentation import TrajectorySegmentationConfig
 from visualization.overlay import run_overlay as run_overlay_processing
 
 
@@ -189,6 +190,9 @@ class TrajectoryAnalysisStep(OrchestrationStep):
         output_jsonl = self.context.output_dir / traj_settings.output_jsonl
         output_csv = self.context.output_dir / traj_settings.output_csv
         output_path_img = self.context.output_dir / traj_settings.output_path_img
+        output_segments_img = None
+        if getattr(traj_settings, "output_segments_img", None):
+            output_segments_img = self.context.output_dir / traj_settings.output_segments_img
 
         io_cfg = TrajectoryIOConfig(
             video_path=str(self.settings.global_settings.video_path.resolve()),
@@ -199,6 +203,7 @@ class TrajectoryAnalysisStep(OrchestrationStep):
             output_jsonl=str(output_jsonl.resolve()),
             output_csv=str(output_csv.resolve()),
             output_path_img=str(output_path_img.resolve()),
+            output_segmentation_img=str(output_segments_img.resolve()) if output_segments_img else None,
         )
 
         analysis_cfg = TrajectoryAnalysisConfig(
@@ -224,6 +229,8 @@ class TrajectoryAnalysisStep(OrchestrationStep):
             ball_diameter_m=traj_settings.ball_diameter_m,
             size_model_min_samples=traj_settings.size_model_min_samples,
             measurement_confidence_floor=traj_settings.measurement_confidence_floor,
+            height_max_m=traj_settings.height_max_m,
+            segmentation=TrajectorySegmentationConfig(**traj_settings.segmentation.model_dump()),
         )
 
         run_ball_trajectory_analysis(io_cfg, analysis_cfg)
@@ -231,6 +238,8 @@ class TrajectoryAnalysisStep(OrchestrationStep):
         self.context.register_artifact("ball_trajectory_jsonl", traj_settings.output_jsonl)
         self.context.register_artifact("ball_trajectory_csv", traj_settings.output_csv)
         self.context.register_artifact("ball_path_image", traj_settings.output_path_img)
+        if output_segments_img:
+            self.context.register_artifact("ball_segments_image", traj_settings.output_segments_img)
 
 
 class OverlayStep(OrchestrationStep):

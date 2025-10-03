@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Literal, Optional, Any
+from typing import Dict, Literal, Optional, Any, List
 
 import yaml
 from pydantic import BaseModel, Field, model_validator, SecretStr
@@ -210,12 +210,41 @@ class BallViterbiConfig(BaseModel):
     image_border_margin_px: float = 10.0
 
 
+class TrajectorySegmentationSettings(BaseModel):
+    enable: bool = True
+    gap_frame_threshold: int = 8
+    smoothing_window_frames: int = 3
+    min_segment_frames: int = 6
+    min_speed_mps: float = 1.0
+    min_heading_speed_mps: float = 3.0
+    speed_jump_abs_mps: float = 2.8
+    speed_jump_mad_multiplier: float = 3.0
+    speed_jump_ratio_min: float = 2.8
+    heading_change_abs_deg: float = 35.0
+    heading_change_mad_multiplier: float = 3.0
+    height_change_abs_m: float = 0.35
+    height_change_mad_multiplier: float = 2.5
+    min_height_for_event_m: float = 0.35
+    require_speed_or_height_for_flip: bool = True
+    gap_guard_frames: int = 4
+    vertical_zero_cross_enable: bool = True
+    min_vertical_speed_mps: float = 2.0
+    speed_jump_noheight_multiplier: float = 1.6
+    max_event_height_m: float = 0.45
+    combined_score_threshold: float = 1.2
+    merge_event_window_frames: int = 3
+    speed_drop_ratio: float = 0.55
+    annotate_segments: bool = True
+
+
 class TrajectoryConfig(BaseModel):
     """Settings for trajectory analysis."""
 
     output_jsonl: str = "ball_trajectory.jsonl"
     output_csv: str = "ball_trajectory.csv"
     output_path_img: str = "ball_path.png"
+    output_segments_img: str = "ball_segments_timeline.png"
+    height_max_m: float = 3.3
     ar_filter_min: float = 0.5
     ar_filter_max: float = 2.2
     ar_filter_alpha: float = 3.0
@@ -237,6 +266,7 @@ class TrajectoryConfig(BaseModel):
     size_model_min_samples: int = Field(12, description="Minimum samples needed to fit the ground-size regression")
     measurement_confidence_floor: float = Field(0.05, description="Minimum detection confidence considered for smoothing")
     viterbi: BallViterbiConfig = Field(default_factory=BallViterbiConfig)
+    segmentation: TrajectorySegmentationSettings = Field(default_factory=TrajectorySegmentationSettings)
 
     @property
     def max_interp_gap(self) -> int:
@@ -270,6 +300,31 @@ class BallVizConfig(BaseModel):
     tail_color: tuple[int, int, int] = (255, 250, 250)
 
 
+class BallSegmentationVizConfig(BaseModel):
+    enable: bool = True
+    palette: List[tuple[int, int, int]] = Field(
+        default_factory=lambda: [
+            (244, 67, 54),
+            (0, 188, 212),
+            (76, 175, 80),
+            (255, 235, 59),
+            (156, 39, 176),
+            (33, 150, 243),
+            (255, 152, 0),
+            (121, 85, 72),
+            (205, 220, 57),
+            (63, 81, 181),
+        ]
+    )
+    tail_length_frames: int = 32
+    tail_thickness: int = 3
+    event_marker_radius: int = 10
+    event_marker_color: tuple[int, int, int] = (255, 255, 255)
+    label_color: tuple[int, int, int] = (240, 240, 240)
+    label_bg: tuple[int, int, int] = (0, 0, 0)
+    label_scale: float = 0.55
+
+
 class BallFilterConfig(BaseModel):
     """Filtering options for ball detections before rendering."""
     kinematic_filter_enable: bool = False
@@ -294,6 +349,7 @@ class OverlayBallConfig(BaseModel):
     min_confidence: float = 0.2
     filter: BallFilterConfig = Field(default_factory=BallFilterConfig)
     visualization: BallVizConfig
+    segmentation_viz: BallSegmentationVizConfig = Field(default_factory=BallSegmentationVizConfig)
 
 class OverlayCourtConfig(BaseModel):
     enable: bool = True

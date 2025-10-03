@@ -37,3 +37,30 @@ trajectory_analysis:
   output_jsonl: "ball_trajectory.jsonl"
   output_csv: "ball_trajectory.csv"
   output_path_img: "ball_path_birdseye.jpg"
+  output_segments_img: "ball_segments_timeline.png"
+  height_max_m: 3.2
+  segmentation:
+    enable: true
+    gap_frame_threshold: 12
+    smoothing_window_frames: 3
+    min_segment_frames: 6
+    min_speed_mps: 1.0
+    min_heading_speed_mps: 2.5
+    speed_jump_abs_mps: 3.0
+    speed_jump_mad_multiplier: 2.8
+    heading_change_abs_deg: 33.0
+    heading_change_mad_multiplier: 2.5
+    height_change_abs_m: 0.35
+    height_change_mad_multiplier: 2.4
+    min_height_for_event_m: 0.35
+    require_speed_or_height_for_flip: true
+    gap_guard_frames: 4
+    vertical_zero_cross_enable: true
+    min_vertical_speed_mps: 2.0
+    speed_jump_noheight_multiplier: 1.8
+    speed_jump_ratio_min: 3.0
+    max_event_height_m: 0.55
+    combined_score_threshold: 1.2
+    merge_event_window_frames: 3
+    speed_drop_ratio: 0.55
+    annotate_segments: true

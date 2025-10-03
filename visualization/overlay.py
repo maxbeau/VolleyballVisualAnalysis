@@ -78,31 +78,72 @@ def _read_court_timeseries(tracking_jsonl: str) -> Tuple[Dict[int, List[Tuple[fl
     return ts, infos
 
 
-def _load_ball_trajectory(jsonl_path: str) -> Dict[int, Dict[str, Any]]:
-    """Loads the final, smoothed ball trajectory data."""
+def _load_ball_trajectory(
+    jsonl_path: str,
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Loads the final, smoothed ball trajectory data and segmentation metadata."""
     tracks: Dict[int, Dict[str, Any]] = {}
+    segments_meta: Dict[int, Dict[str, Any]] = {}
+    events: List[Dict[str, Any]] = []
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     record = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                try:
                     frame_idx = int(record["frame"])
-                    tracks[frame_idx] = {
-                        "box": (
-                            float(record["img_x"]) - float(record["w"]) / 2.0,
-                            float(record["img_y"]) - float(record["h"]) / 2.0,
-                            float(record["w"]),
-                            float(record["h"]),
-                        ),
-                        "confidence": float(record["confidence"]),
+                    cx = float(record.get("img_x", 0.0))
+                    cy = float(record.get("img_y", 0.0))
+                    w = float(record.get("w", 0.0) or 0.0)
+                    h = float(record.get("h", 0.0) or 0.0)
+                    box = (cx - w / 2.0, cy - h / 2.0, w, h)
+                    segment_id = record.get("segment_id")
+                    touch_event = record.get("touch_event")
+                    track_rec = {
+                        "box": box,
+                        "confidence": float(record.get("confidence", 0.0) or 0.0),
                         "raw": record,
+                        "segment_id": int(segment_id) if segment_id is not None else None,
+                        "touch_event": touch_event,
+                        "center": (cx, cy),
                     }
-                except (json.JSONDecodeError, KeyError, TypeError):
+                    tracks[frame_idx] = track_rec
+
+                    if track_rec["segment_id"] is not None:
+                        seg_id = track_rec["segment_id"]
+                        meta = segments_meta.setdefault(
+                            seg_id,
+                            {
+                                "start_frame": None,
+                                "end_frame": None,
+                                "duration_sec": None,
+                                "change_reason": None,
+                                "change_score": None,
+                            },
+                        )
+                        if record.get("segment_is_start"):
+                            meta["start_frame"] = frame_idx
+                        if record.get("segment_is_end"):
+                            meta["end_frame"] = frame_idx
+                            if record.get("segment_change_reason"):
+                                meta["change_reason"] = record.get("segment_change_reason")
+                            if record.get("segment_change_score") is not None:
+                                meta["change_score"] = record.get("segment_change_score")
+                        if record.get("segment_duration_sec") is not None:
+                            meta["duration_sec"] = record.get("segment_duration_sec")
+
+                    if isinstance(touch_event, dict):
+                        evt = dict(touch_event)
+                        evt["frame"] = frame_idx
+                        events.append(evt)
+                except (KeyError, TypeError, ValueError):
                     continue
     except FileNotFoundError:
         print(f"Warning: Ball trajectory file not found at {jsonl_path}")
-        return {}
-    return tracks
+        return {}, {}, []
+    return tracks, segments_meta, events
 
 
 class MiniCourtOverlay:
@@ -273,7 +314,41 @@ def run_overlay(
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    ball_tracks = _load_ball_trajectory(ball_trajectory_jsonl)
+    ball_tracks, segments_meta, _ = _load_ball_trajectory(ball_trajectory_jsonl)
+
+    ball_cfg = cfg.get("ball", {}) or {}
+    default_ball_color = tuple(int(v) for v in ball_cfg.get("color", (0, 255, 0)))
+    default_ball_thickness = int(ball_cfg.get("thickness", 2))
+    seg_viz_cfg = ball_cfg.get("segmentation_viz", {}) or {}
+    seg_enable = bool(seg_viz_cfg.get("enable", True)) and bool(ball_tracks)
+    seg_palette = seg_viz_cfg.get("palette") or [
+        (244, 67, 54),
+        (0, 188, 212),
+        (76, 175, 80),
+        (255, 235, 59),
+        (156, 39, 176),
+        (33, 150, 243),
+        (255, 152, 0),
+        (121, 85, 72),
+        (205, 220, 57),
+        (63, 81, 181),
+    ]
+    seg_palette = [tuple(int(v) for v in color) for color in seg_palette]
+    seg_tail_length = int(seg_viz_cfg.get("tail_length_frames", 32))
+    seg_tail_thickness = int(seg_viz_cfg.get("tail_thickness", 3))
+    seg_event_radius = int(seg_viz_cfg.get("event_marker_radius", 10))
+    seg_event_color = tuple(int(v) for v in seg_viz_cfg.get("event_marker_color", (255, 255, 255)))
+    seg_label_color = tuple(int(v) for v in seg_viz_cfg.get("label_color", (240, 240, 240)))
+    seg_label_bg = tuple(int(v) for v in seg_viz_cfg.get("label_bg", (0, 0, 0)))
+    seg_label_scale = float(seg_viz_cfg.get("label_scale", 0.55))
+
+    segment_color_map: Dict[int, Tuple[int, int, int]] = {}
+    if seg_enable:
+        ordered_segment_ids = sorted(segments_meta.keys())
+        for idx, seg_id in enumerate(ordered_segment_ids):
+            segment_color_map[seg_id] = seg_palette[idx % len(seg_palette)] if seg_palette else (0, 200, 0)
+
+    segment_tails: Dict[int, List[Tuple[int, Tuple[float, float]]]] = {}
 
     output_video_path = os.path.join(output_dir, cfg.get("output_video_path", "full_overlay.mp4"))
     fourcc = cv2.VideoWriter_fourcc(*cfg.get("codec", "mp4v"))
@@ -323,16 +398,78 @@ def run_overlay(
             thickness = int(court_cfg.get("thickness", 2))
             cv2.polylines(frame, [corners], isClosed=True, color=court_color, thickness=thickness)
 
-        # Draw ball
+        # Draw ball and segmentation cues
         if frame_idx in ball_tracks:
             track = ball_tracks[frame_idx]
             x, y, w, h = track['box']
             tl = (int(x), int(y))
             br = (int(x + w), int(y + h))
-            ball_cfg = cfg.get("ball", {}) or {}
-            ball_color = tuple(ball_cfg.get("color", (0, 255, 0)))
-            ball_thickness = int(ball_cfg.get("thickness", 2))
+            segment_id = track.get("segment_id")
+            ball_color = (
+                segment_color_map.get(segment_id, default_ball_color)
+                if seg_enable and segment_id is not None
+                else default_ball_color
+            )
+            ball_thickness = default_ball_thickness
             cv2.rectangle(frame, tl, br, ball_color, ball_thickness)
+
+            if seg_enable and segment_id is not None:
+                center = track.get("center")
+                if center:
+                    cx, cy = float(center[0]), float(center[1])
+                    tail = segment_tails.setdefault(segment_id, [])
+                    tail.append((frame_idx, (cx, cy)))
+                    if seg_tail_length > 0:
+                        while tail and frame_idx - tail[0][0] > seg_tail_length:
+                            tail.pop(0)
+                    if len(tail) >= 2 and seg_tail_thickness > 0:
+                        pts = np.array(
+                            [(int(pt[0]), int(pt[1])) for _, pt in tail if pt is not None],
+                            dtype=np.int32,
+                        )
+                        if pts.size >= 4:
+                            cv2.polylines(
+                                frame,
+                                [pts],
+                                False,
+                                ball_color,
+                                seg_tail_thickness,
+                                lineType=cv2.LINE_AA,
+                            )
+
+                    draw_boxed_text(
+                        frame,
+                        f"S{segment_id}",
+                        (tl[0], max(0, tl[1] - 6)),
+                        color=seg_label_color,
+                        bg=seg_label_bg,
+                        scale=seg_label_scale,
+                        thickness=1,
+                    )
+
+                    touch_event = track.get("touch_event")
+                    if isinstance(touch_event, dict):
+                        center_px = (int(cx), int(cy))
+                        if seg_event_radius > 0:
+                            cv2.circle(
+                                frame,
+                                center_px,
+                                seg_event_radius,
+                                seg_event_color,
+                                thickness=2,
+                                lineType=cv2.LINE_AA,
+                            )
+                        label = touch_event.get("reason")
+                        if label:
+                            draw_boxed_text(
+                                frame,
+                                label,
+                                (center_px[0] + seg_event_radius + 4, center_px[1] - seg_event_radius - 4),
+                                color=seg_label_color,
+                                bg=seg_label_bg,
+                                scale=max(0.45, seg_label_scale - 0.05),
+                                thickness=1,
+                            )
 
         # Draw players
         if players_enabled and frame_idx in players_by_frame:
