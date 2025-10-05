@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Literal, Optional, Any, List
+from typing import Dict, Literal, Optional, Any, List, Tuple
 
 import yaml
 from pydantic import BaseModel, Field, model_validator, SecretStr
@@ -45,6 +45,7 @@ class DetectionYoloConfig(BaseModel):
     players: Path | None = None
     ball: Path | None = None
     actions: Path | None = None
+    net: Path | None = None
 
 class DetectionConfig(BaseModel):
     """Settings for the object detection stage."""
@@ -58,9 +59,9 @@ class DetectionConfig(BaseModel):
         description="Loaded exclusively from the ROBOFLOW_API_KEY environment variable",
     )
     infer_fps: Dict[str, int] = {
-        "court": 3, "players": 6, "ball": 12, "actions": 2
+        "court": 3, "players": 6, "ball": 12, "actions": 2, "net": 2
     }
-    models_roboflow: Dict[str, str]
+    models_roboflow: Dict[str, Optional[str]]
     models_yolo: DetectionYoloConfig
 
     @model_validator(mode='after')
@@ -126,6 +127,9 @@ class CourtKalmanConfig(BaseModel):
     kalman_q_pos: float = 1e-2
     kalman_q_vel: float = 5e-2
     kalman_r_meas: float = 2.0
+    homography_q: float = 5e-4
+    homography_r: float = 2.0
+    homography_static_scale: float = 0.1
     kf_adaptive_from_template: bool = True
     kf_r_api_min: float = 0.8
     kf_r_api_max: float = 2.5
@@ -164,12 +168,43 @@ class CourtSentinelConfig(BaseModel):
     drift_score_threshold: float = 3.0
 
 
+class CourtNetConfig(BaseModel):
+    """Settings for volleyball net estimation coupled with the court."""
+    enable: bool = True
+    measurement_min_confidence: float = 0.25
+    kalman_q: float = 18.0
+    kalman_r: float = 140.0
+    max_height_jump_px: float = 90.0
+    height_bounds_px: Tuple[float, float] = (40.0, 420.0)
+    fallback_height_px: float = 110.0
+    hold_frames_without_measure: int = 20
+    label_aliases: List[str] = Field(default_factory=lambda: ["net", "volleyball net"])
+    court_length_m: float = 18.0
+    court_width_m: float = 9.0
+    physical_height_m: float = 2.43
+    model_process_q_m: float = 1e-3
+    model_measure_r_m: float = 2e-2
+    px_per_meter_kalman_q: float = 0.8
+    px_per_meter_kalman_r: float = 25.0
+    model_measure_blend: float = 0.4
+    model_measure_gate_px: float = 64.0
+
 
 class CourtPerformanceConfig(BaseModel):
     """Settings for performance and robustness tuning."""
     use_roi_downsample: bool = True
     roi_downsample_scale: float = 0.5
     model_fallback_affine_on_fail: bool = True
+
+
+class CourtFallbackConfig(BaseModel):
+    """Settings for motion fallback refinement."""
+    ecc_enable: bool = True
+    ecc_min_tpl_precision: float = 0.24
+    ecc_downscale: float = 0.5
+    ecc_gauss_kernel: int = 5
+    ecc_max_iterations: int = 40
+    ecc_epsilon: float = 1e-4
 
 class CourtHomographyConfig(BaseModel):
     """Settings for homography and bird's-eye view generation."""
@@ -193,7 +228,9 @@ class CourtConfig(BaseModel):
     kalman: CourtKalmanConfig
     bootstrap: CourtBootstrapConfig = Field(default_factory=CourtBootstrapConfig)
     sentinel: CourtSentinelConfig = Field(default_factory=CourtSentinelConfig)
+    net: CourtNetConfig = Field(default_factory=CourtNetConfig)
     performance: CourtPerformanceConfig
+    fallback: CourtFallbackConfig = Field(default_factory=CourtFallbackConfig)
     homography: CourtHomographyConfig
     outputs: CourtOutputConfig
 
@@ -384,6 +421,14 @@ class OverlayBallConfig(BaseModel):
     visualization: BallVizConfig
     segmentation_viz: BallSegmentationVizConfig = Field(default_factory=BallSegmentationVizConfig)
 
+
+class OverlayNetConfig(BaseModel):
+    enable: bool = True
+    color: tuple[int, int, int] = (255, 255, 255)
+    thickness: int = 2
+    fill_alpha: float = 0.18
+    post_radius: int = 4
+
 class OverlayCourtConfig(BaseModel):
     enable: bool = True
     method: Literal["timeseries"] = "timeseries"
@@ -400,6 +445,7 @@ class OverlayCourtConfig(BaseModel):
     mini_scale: float = 0.24
     mini_show_label: bool = True
     mini_draw_poly: bool = True
+    net: OverlayNetConfig = Field(default_factory=OverlayNetConfig)
 
 class OverlayPlayersConfig(BaseModel):
     enable: bool = True

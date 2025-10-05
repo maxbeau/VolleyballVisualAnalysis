@@ -146,6 +146,42 @@ def _load_ball_trajectory(
     return tracks, segments_meta, events
 
 
+def _draw_net_overlay(
+    frame: np.ndarray,
+    net_info: Optional[Dict[str, Any]],
+    *,
+    color: Tuple[int, int, int],
+    thickness: int,
+    fill_alpha: float,
+    post_radius: int,
+) -> None:
+    if not net_info:
+        return
+
+    polygon = net_info.get("polygon")
+    alpha = float(max(0.0, min(1.0, fill_alpha)))
+    try:
+        if polygon and len(polygon) >= 4:
+            pts = np.array([[float(p[0]), float(p[1])] for p in polygon[:4]], dtype=np.float32)
+            pts_i = np.round(pts).astype(np.int32)
+            if alpha > 0.0:
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [pts_i], color)
+                cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+            cv2.polylines(frame, [pts_i], isClosed=True, color=color, thickness=max(1, int(thickness)), lineType=cv2.LINE_AA)
+    except Exception:
+        pass
+
+    if post_radius > 0:
+        base_pts = net_info.get("base") or []
+        for pt in base_pts[:2]:
+            try:
+                bx, by = int(round(float(pt[0]))), int(round(float(pt[1])))
+                cv2.circle(frame, (bx, by), int(max(1, post_radius)), color, -1, lineType=cv2.LINE_AA)
+            except Exception:
+                continue
+
+
 class MiniCourtOverlay:
     """Helper to render the miniature court overlay with configuration defaults."""
 
@@ -385,6 +421,7 @@ def run_overlay(
 
     # --- Main processing loop ---
     frame_idx = 0
+    last_net_state: Optional[Dict[str, Any]] = None
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -394,9 +431,30 @@ def run_overlay(
         if frame_idx in court_ts:
             corners = np.array(court_ts[frame_idx], dtype=np.int32)
             court_cfg = cfg.get("court", {}) or {}
-            court_color = tuple(court_cfg.get("color", (255, 255, 255)))
+            court_color = tuple(int(v) for v in court_cfg.get("color", (255, 255, 255)))
             thickness = int(court_cfg.get("thickness", 2))
             cv2.polylines(frame, [corners], isClosed=True, color=court_color, thickness=thickness)
+
+            net_cfg = court_cfg.get("net", {}) or {}
+            info_frame = court_infos.get(frame_idx)
+            net_payload = info_frame.get("net") if isinstance(info_frame, dict) else None
+            if isinstance(net_payload, dict):
+                last_net_state = net_payload
+            if net_cfg.get("enable", True):
+                net_to_draw = net_payload or last_net_state
+                if isinstance(net_to_draw, dict):
+                    net_color = tuple(int(v) for v in net_cfg.get("color", (255, 255, 255)))
+                    net_thickness = int(net_cfg.get("thickness", 2))
+                    net_fill_alpha = float(net_cfg.get("fill_alpha", 0.18))
+                    net_post_radius = int(net_cfg.get("post_radius", 4))
+                    _draw_net_overlay(
+                        frame,
+                        net_to_draw,
+                        color=net_color,
+                        thickness=net_thickness,
+                        fill_alpha=net_fill_alpha,
+                        post_radius=net_post_radius,
+                    )
 
         # Draw ball and segmentation cues
         if frame_idx in ball_tracks:

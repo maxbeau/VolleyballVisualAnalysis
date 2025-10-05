@@ -31,6 +31,7 @@ class Orchestrator:
             DetectionStep(self.context, "players"),
             DetectionStep(self.context, "ball"),
             DetectionStep(self.context, "actions"),
+            DetectionStep(self.context, "net"),
             CourtProcessingStep(self.context),
             CourtHomographyStep(self.context),
             PlayersTrackingStep(self.context),
@@ -45,7 +46,7 @@ class Orchestrator:
         steps_to_run = set()
 
         step_groups = {
-            "detection": ["detection_court", "detection_players", "detection_ball", "detection_actions"],
+            "detection": ["detection_court", "detection_players", "detection_ball", "detection_actions", "detection_net"],
             "court_processing": [None],
             "court_homography": [None],
             "players_tracking": [None],

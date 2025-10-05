@@ -31,6 +31,9 @@ court:
     kalman_q_pos: 1e-2
     kalman_q_vel: 5e-2
     kalman_r_meas: 2.0
+    homography_q: 5.0e-4
+    homography_r: 2.0
+    homography_static_scale: 0.1
     kf_adaptive_from_template: true
     kf_r_api_min: 0.8
     kf_r_api_max: 2.5
@@ -62,10 +65,39 @@ court:
     geo_area_tol: 0.6
     geo_patience: 4
     drift_score_threshold: 3.0
+  net:
+    enable: true
+    measurement_min_confidence: 0.25
+    kalman_q: 18.0
+    kalman_r: 100.0
+    max_height_jump_px: 90.0
+    height_bounds_px: [40.0, 420.0]
+    fallback_height_px: 90.0
+    hold_frames_without_measure: 20
+    direction_ema_alpha: 0.1
+    label_aliases:
+      - "net"
+      - "volleyball net"
+    court_length_m: 18.0
+    court_width_m: 9.0
+    physical_height_m: 2.43
+    model_process_q_m: 0.001
+    model_measure_r_m: 0.02
+    px_per_meter_kalman_q: 0.8
+    px_per_meter_kalman_r: 25.0
+    model_measure_blend: 0.4
+    model_measure_gate_px: 64.0
   performance:
     use_roi_downsample: true
     roi_downsample_scale: 0.5
     model_fallback_affine_on_fail: true
+  fallback:
+    ecc_enable: true
+    ecc_min_tpl_precision: 0.24
+    ecc_downscale: 0.6
+    ecc_gauss_kernel: 5
+    ecc_max_iterations: 40
+    ecc_epsilon: 1.0e-4
   homography:
     scale_px_per_meter: 20.0
     birdseye_frame_index: 100

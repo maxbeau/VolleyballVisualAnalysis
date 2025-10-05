@@ -45,6 +45,8 @@ Each major step has its own configuration file, such as:
 -   `config/trajectory_analysis.yaml`
 -   `config.overlay.yaml`
 
+Key highlights for the updated court tracker configuration include a new `fallback` block that enables an ECC-based motion refinement when optical flow + RANSAC struggle, as well as automatically exposing the net vanishing-point estimate used for stabilising net height. 另外，Kalman 段现在直接对 8 个同伦参数执行滤波，从而在几何上约束四角点并抑制慢漂移。
+
 The system automatically loads and merges all `*.yaml` files from the `config/` directory at startup.
 
 ---

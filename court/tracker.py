@@ -1,6 +1,7 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, List, Dict, Any
+import math
 
 import numpy as np
 import cv2
@@ -15,103 +16,163 @@ from court.utils import (
     shape_metrics as _shape_metrics_util,
     within_tol as _within_tol_util,
 )
+from court.sentinel import DriftSentinel
+from court.net_tracker import NetTracker
+from court.motion_estimator import MotionEstimator
 
 
 Point = Tuple[float, float]
 
 
-class MultiCornerKalman:
-    """Kalman filter for 4 corners with constant-velocity model.
-    State: positions(8) + velocities(8) = 16-dim; Measurement: positions(8).
-    """
-    def __init__(self, q_pos: float = 1e-2, q_vel: float = 5e-2, r_meas: float = 2.0) -> None:
-        self.q_pos = float(q_pos)
-        self.q_vel = float(q_vel)
-        self.r_meas = float(r_meas)
+class HomographyKalman:
+    """Lightweight Kalman filter that operates directly on the 8 DoF homography."""
+
+    def __init__(
+        self,
+        q: float = 5e-4,
+        r: float = 2.0,
+        *,
+        static_scale: float = 0.1,
+    ) -> None:
+        self.base_q = float(max(q, 1e-12))
+        self.base_r = float(max(r, 1e-12))
+        self.static_scale = float(max(min(static_scale, 1.0), 1e-3))
         self.x: Optional[np.ndarray] = None
         self.P: Optional[np.ndarray] = None
-        self.F: Optional[np.ndarray] = None
-        self.H: Optional[np.ndarray] = None
-        self.Q: Optional[np.ndarray] = None
-        self.R: Optional[np.ndarray] = None
-        self._static_q: Optional[np.ndarray] = None
+        self.q_scale: float = 1.0
+        self._static = False
 
-    def reset(self, corners: np.ndarray) -> None:
-        c = corners.reshape(4, 2).astype(np.float64)
-        pos = c.flatten()  # 8
-        vel = np.zeros_like(pos)
-        self.x = np.concatenate([pos, vel])  # (16,)
-        self.P = np.eye(16) * 10.0
-        I8 = np.eye(8)
-        Z8 = np.zeros((8, 8))
-        # F for dt=1: [I, I; 0, I]
-        self.F = np.block([[I8, I8], [Z8, I8]])
-        # H selects position components
-        self.H = np.block([np.eye(8), np.zeros((8, 8))])
-        # Process and measurement noise
-        Qpos = np.eye(8) * self.q_pos
-        Qvel = np.eye(8) * self.q_vel
-        self.Q = np.block([[Qpos, np.zeros((8, 8))], [np.zeros((8, 8)), Qvel]])
-        # Pre-calculate static Q (with zero velocity noise)
-        Qvel_static = np.zeros((8, 8))
-        self._static_q = np.block([[Qpos, np.zeros((8, 8))], [np.zeros((8, 8)), Qvel_static]])
-        self.R = np.eye(8) * (self.r_meas ** 2)
+    @staticmethod
+    def _normalize_h(H: np.ndarray) -> np.ndarray:
+        H = np.asarray(H, dtype=np.float64)
+        if H.shape != (3, 3):
+            raise ValueError("Homography must be 3x3")
+        if abs(H[2, 2]) < 1e-12:
+            return H
+        return H / H[2, 2]
 
-    def predict(self) -> None:
-        if self.x is None:
-            return
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
+    @staticmethod
+    def _to_vec(H: np.ndarray) -> np.ndarray:
+        Hn = HomographyKalman._normalize_h(H)
+        return np.array(
+            [
+                Hn[0, 0],
+                Hn[0, 1],
+                Hn[0, 2],
+                Hn[1, 0],
+                Hn[1, 1],
+                Hn[1, 2],
+                Hn[2, 0],
+                Hn[2, 1],
+            ],
+            dtype=np.float64,
+        )
 
-    def update(self, corners: Optional[np.ndarray]) -> np.ndarray:
-        # Predict
-        self.predict()
-        # Initialize on first call if needed
-        if self.x is None:
-            if corners is None:
-                raise RuntimeError("Kalman: no state and no measurement")
-            self.reset(corners)
-            return corners.astype(np.float64)
-        # Update if measurement available
-        if corners is not None:
-            z = corners.reshape(-1).astype(np.float64)
-            y = z - (self.H @ self.x)
-            S = self.H @ self.P @ self.H.T + self.R
-            K = self.P @ self.H.T @ np.linalg.inv(S)
-            self.x = self.x + K @ y
-            I = np.eye(self.P.shape[0])
-            self.P = (I - K @ self.H) @ self.P
-        # Return smoothed positions
-        pos = (self.H @ self.x).reshape(4, 2)
-        return pos
+    @staticmethod
+    def _to_matrix(vec: np.ndarray) -> np.ndarray:
+        v = np.asarray(vec, dtype=np.float64).reshape(8)
+        H = np.array(
+            [
+                [v[0], v[1], v[2]],
+                [v[3], v[4], v[5]],
+                [v[6], v[7], 1.0],
+            ],
+            dtype=np.float64,
+        )
+        return HomographyKalman._normalize_h(H)
+
+    def reset(self, H: np.ndarray) -> None:
+        vec = self._to_vec(H)
+        self.x = vec.copy()
+        self.P = np.eye(8, dtype=np.float64) * self.base_r
 
     def set_process_scale(self, scale: float) -> None:
-        """Rebuild process noise Q using base q_pos/q_vel scaled by factor."""
         try:
-            s = float(scale)
-            if s <= 0:
-                s = 1.0
-            I8 = np.eye(8)
-            Qpos = I8 * (self.q_pos * s)
-            Qvel = I8 * (self.q_vel * s)
-            self.Q = np.block([[Qpos, np.zeros((8, 8))], [np.zeros((8, 8)), Qvel]])
+            self.q_scale = float(scale)
+            if self.q_scale <= 0:
+                self.q_scale = 1.0
         except Exception:
-            pass
+            self.q_scale = 1.0
 
     def set_static(self, is_static: bool) -> None:
-        """Dynamically switch the process noise Q to a static model if needed."""
-        if self.Q is None or self._static_q is None:
-            return
-        if is_static:
-            self.Q = self._static_q
-        else:
-            # Restore the dynamic Q by re-building it from current base parameters
-            # This ensures that if set_process_scale was called, we restore the scaled version
-            # For simplicity, we rebuild with the original q_pos and q_vel
-            I8 = np.eye(8)
-            Qpos = I8 * self.q_pos
-            Qvel = I8 * self.q_vel
-            self.Q = np.block([[Qpos, np.zeros((8, 8))], [np.zeros((8, 8)), Qvel]])
+        self._static = bool(is_static)
+
+    def predict(self) -> Optional[np.ndarray]:
+        if self.x is None or self.P is None:
+            return None
+        q = self.base_q * self.q_scale
+        if self._static:
+            q *= self.static_scale
+        Q = np.eye(8, dtype=np.float64) * q
+        self.P = self.P + Q
+        return self.x.copy()
+
+    def update(self, H_meas: np.ndarray, *, meas_scale: float = 1.0) -> np.ndarray:
+        if H_meas is None:
+            if self.x is None:
+                raise RuntimeError("HomographyKalman: measurement required for initialisation")
+            return self.x.copy()
+
+        z = self._to_vec(H_meas)
+        if not np.all(np.isfinite(z)):
+            return self.x.copy() if self.x is not None else z
+
+        if self.x is None or self.P is None:
+            self.reset(H_meas)
+            return self.x.copy()
+
+        R_scale = float(max(meas_scale, 1e-6))
+        R = np.eye(8, dtype=np.float64) * (self.base_r * R_scale)
+
+        S = self.P + R
+        K = self.P @ np.linalg.inv(S)
+        self.x = self.x + K @ (z - self.x)
+        I = np.eye(8, dtype=np.float64)
+        self.P = (I - K) @ self.P
+        return self.x.copy()
+
+    def current_matrix(self) -> Optional[np.ndarray]:
+        if self.x is None:
+            return None
+        try:
+            return self._to_matrix(self.x)
+        except Exception:
+            return None
+
+
+class ScalarKalman1D:
+    """Lightweight scalar Kalman filter for net height smoothing."""
+
+    def __init__(self, q: float, r: float) -> None:
+        self.q = float(max(q, 1e-9))
+        self.r = float(max(r, 1e-9))
+        self.x: Optional[float] = None
+        self.P: float = float(self.r)
+
+    def reset(self, value: float, variance: Optional[float] = None) -> float:
+        self.x = float(value)
+        self.P = float(variance if (variance is not None and variance > 0) else self.r)
+        return self.x
+
+    def predict(self) -> Optional[float]:
+        if self.x is None:
+            return None
+        self.P += self.q
+        return self.x
+
+    def update(self, measurement: float, r: Optional[float] = None) -> Optional[float]:
+        if measurement is None:
+            return self.x
+        meas = float(measurement)
+        if self.x is None:
+            return self.reset(meas, r)
+        R = float(r) if r is not None and r > 0 else self.r
+        if R <= 0:
+            R = self.r
+        K = self.P / (self.P + R)
+        self.x = self.x + K * (meas - self.x)
+        self.P = (1.0 - K) * self.P
+        return self.x
 
 
 class CourtLKTracker:
@@ -133,6 +194,7 @@ class CourtLKTracker:
 
     def __init__(self, cfg: CourtConfig) -> None:
         self.cfg = cfg
+        self.fallback_cfg = getattr(cfg, "fallback", None)
 
         # State
         self.keyframe_idx: Optional[int] = None
@@ -149,15 +211,19 @@ class CourtLKTracker:
         self.ref_area: Optional[float] = None
         # keyframe <-> model
         self.H_key_img_to_model: Optional[np.ndarray] = None
+        self.H_model_to_key_img: Optional[np.ndarray] = None
         self.model_size: Optional[Tuple[int, int]] = None
         self.model_template: Optional[np.ndarray] = None  # uint8 mask (W,H)
-        # Kalman filter
-        self.KF: Optional[MultiCornerKalman] = None
-
+        # Homography filter
+        self.H_filter: Optional[HomographyKalman] = None
+        
+        # Initialize Drift Sentinel
+        self._sentinel = DriftSentinel(cfg)
+        
+        # Initialize Net Tracker
+        self._net_tracker = NetTracker(getattr(cfg, "net", None))
+        
         # Cached OpenCV params to avoid recreating tuples every frame
-        self._lk_win = (21, 21)
-        self._lk_levels = 3
-        self._lk_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         self._subpix_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.01)
         # Throttle expensive template scoring: compute every N frames (configurable)
         self._tpl_stride = int(self.cfg.gates.template_stride)
@@ -165,11 +231,13 @@ class CourtLKTracker:
         # ROI dynamic scale factor (>=1.0)
         self._roi_scale = 1.0
         # Last template precision (for keyframes)
-        self.last_tpl_prec: Optional[float] = None
         # Frame tick for throttling certain ops (e.g., subpix)
         self._frame_tick: int = 0
         # Background executor to parallelize heavy OpenCV routines
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=3)
+        
+        # Initialize Motion Estimator (after executor is created)
+        self._motion_estimator = MotionEstimator(cfg, self._executor)
         # Track recent motion magnitudes for adaptive filtering
         self._motion_history: deque[float] = deque(maxlen=20)
         self._early_stop_streak: int = 0
@@ -179,10 +247,19 @@ class CourtLKTracker:
         self._bootstrap_meta: Optional[Dict[str, Any]] = None
         # Track absolute frame index for sentinel bookkeeping
         self._frame_index: int = -1
-        # Drift sentinel state
-        self._sentinel_state: Dict[str, Any] = {}
-        self._last_sentinel_reasons: Optional[List[str]] = None
-        self._reset_sentinel_state(frame_index=-1)
+        
+        # Store last template precision directly, as it's used by external code
+        self._last_tpl_prec: Optional[float] = None
+        
+    @property
+    def net_state(self) -> Optional[Dict[str, Any]]:
+        """Access net state from the NetTracker."""
+        return self._net_tracker.net_state
+    
+    @property
+    def last_tpl_prec(self) -> Optional[float]:
+        """Access last template precision."""
+        return self._last_tpl_prec
 
     # ---------- bootstrap helpers ----------
     def build_bootstrap_reference(
@@ -274,153 +351,6 @@ class CourtLKTracker:
             "corners": [(float(x), float(y)) for x, y in ordered],
             "meta": meta,
         }
-
-    # ---------- sentinel helpers ----------
-    def _reset_sentinel_state(self, frame_index: int) -> None:
-        try:
-            warmup = max(int(self.cfg.sentinel.warmup_frames), 0)
-            min_gap = max(int(self.cfg.sentinel.min_gap_frames), 0)
-        except AttributeError:
-            warmup = 0
-            min_gap = 0
-        self._sentinel_state = {
-            "hold_streak": 0,
-            "bad_inlier": 0,
-            "bad_matches": 0,
-            "bad_err": 0,
-            "bad_template": 0,
-            "bad_geo": 0,
-            "last_request_frame": int(frame_index) - min_gap,
-            "last_reset_frame": int(frame_index),
-            "last_good_frame": int(frame_index),
-            "cooldown_until": int(frame_index) + warmup,
-            "template_ref": None,
-        }
-        self._last_sentinel_reasons = None
-
-    def _sentinel_enabled(self) -> bool:
-        try:
-            return bool(self.cfg.sentinel.enable)
-        except AttributeError:
-            return False
-
-    def _sentinel_can_trigger(self, frame_idx: int) -> bool:
-        if not self._sentinel_enabled():
-            return False
-        cfg = self.cfg.sentinel
-        state = self._sentinel_state
-        if frame_idx - state.get("last_reset_frame", -10**9) < max(int(cfg.warmup_frames), 0):
-            return False
-        if frame_idx < state.get("cooldown_until", -10**9):
-            return False
-        if frame_idx - state.get("last_request_frame", -10**9) < max(int(cfg.min_gap_frames), 0):
-            return False
-        return True
-
-    def _sentinel_on_success(
-        self,
-        info: Dict[str, Any],
-        *,
-        frame_idx: int,
-        ratio: float,
-        area: float,
-        med_err: float,
-        matches: int,
-        inlier_ratio: float,
-        template_score: Optional[float],
-    ) -> None:
-        if not self._sentinel_enabled():
-            return
-        cfg = self.cfg.sentinel
-        state = self._sentinel_state
-
-        state["last_good_frame"] = frame_idx
-        state["hold_streak"] = 0
-
-        reasons: List[str] = []
-
-        if inlier_ratio < cfg.inlier_ratio_floor:
-            state["bad_inlier"] = state.get("bad_inlier", 0) + 1
-        else:
-            state["bad_inlier"] = 0
-        if state["bad_inlier"] >= max(cfg.inlier_ratio_patience, 1):
-            reasons.append("inlier_ratio")
-
-        if matches < cfg.matches_floor:
-            state["bad_matches"] = state.get("bad_matches", 0) + 1
-        else:
-            state["bad_matches"] = 0
-        if state["bad_matches"] >= max(cfg.matches_patience, 1):
-            reasons.append("tracks")
-
-        if med_err > cfg.reproj_median_ceiling:
-            state["bad_err"] = state.get("bad_err", 0) + 1
-        else:
-            state["bad_err"] = 0
-        if state["bad_err"] >= max(cfg.reproj_patience, 1):
-            reasons.append("reproj_error")
-
-        if template_score is not None:
-            ref = state.get("template_ref")
-            if ref is None or template_score > ref:
-                state["template_ref"] = float(template_score)
-                state["bad_template"] = 0
-            elif (ref - template_score) > cfg.template_drop:
-                state["bad_template"] = state.get("bad_template", 0) + 1
-            else:
-                state["bad_template"] = 0
-            if state["bad_template"] >= max(cfg.template_patience, 1):
-                reasons.append("template_drop")
-
-        geo_flag = False
-        if self.ref_ratio is not None:
-            if abs(ratio - self.ref_ratio) > cfg.geo_ratio_tol * max(1.0, self.ref_ratio):
-                geo_flag = True
-        if self.ref_area is not None and self.ref_area > 1e-6:
-            rel_area = abs(area - self.ref_area) / max(self.ref_area, 1e-6)
-            if rel_area > cfg.geo_area_tol:
-                geo_flag = True
-        if geo_flag:
-            state["bad_geo"] = state.get("bad_geo", 0) + 1
-        else:
-            state["bad_geo"] = 0
-        if state["bad_geo"] >= max(cfg.geo_patience, 1):
-            reasons.append("geometry")
-
-        score = 0.0
-        score += state.get("bad_inlier", 0) / max(cfg.inlier_ratio_patience, 1)
-        score += state.get("bad_matches", 0) / max(cfg.matches_patience, 1)
-        score += state.get("bad_err", 0) / max(cfg.reproj_patience, 1)
-        score += state.get("bad_template", 0) / max(cfg.template_patience, 1)
-        score += state.get("bad_geo", 0) / max(cfg.geo_patience, 1)
-        if score >= max(cfg.drift_score_threshold, 0.0):
-            reasons.append("drift_score")
-
-        if reasons and self._sentinel_can_trigger(frame_idx):
-            info["needs_redetect"] = True
-            info["sentinel_reasons"] = sorted(set(reasons))
-            self._last_sentinel_reasons = info["sentinel_reasons"]
-            state["last_request_frame"] = frame_idx
-            state["cooldown_until"] = frame_idx + max(cfg.min_gap_frames, cfg.hold_bad_frames)
-            state["bad_inlier"] = state["bad_matches"] = state["bad_err"] = state["bad_template"] = state["bad_geo"] = 0
-
-    def _sentinel_on_hold(self, info: Dict[str, Any], *, frame_idx: int, reason: str) -> None:
-        if not self._sentinel_enabled():
-            return
-        cfg = self.cfg.sentinel
-        state = self._sentinel_state
-        state["hold_streak"] = state.get("hold_streak", 0) + 1
-        if state["hold_streak"] >= max(cfg.hold_bad_frames, 1) and self._sentinel_can_trigger(frame_idx):
-            reasons = info.setdefault("sentinel_reasons", [])
-            reasons.append(reason)
-            info["needs_redetect"] = True
-            self._last_sentinel_reasons = reasons
-            state["last_request_frame"] = frame_idx
-            state["cooldown_until"] = frame_idx + max(cfg.min_gap_frames, cfg.hold_bad_frames)
-            state["hold_streak"] = 0
-            state["bad_inlier"] = state["bad_matches"] = state["bad_err"] = state["bad_template"] = state["bad_geo"] = 0
-        elif state["hold_streak"] > cfg.hold_bad_frames:
-            state["hold_streak"] = cfg.hold_bad_frames
 
     # ---------- adaptive KF helpers ----------
     def _adaptive_kf_sigma(self, tscore: Optional[float]) -> float:
@@ -541,141 +471,14 @@ class CourtLKTracker:
         H_model_to_curr = H_model_to_key @ H_key_to_curr
         return template_precision_score(gray, H_model_to_curr, self.model_template)
 
-    def _lk_flow(
-        self,
-        prev_img: np.ndarray,
-        curr_img: np.ndarray,
-        pts: np.ndarray,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        try:
-            return cv2.calcOpticalFlowPyrLK(
-                prev_img,
-                curr_img,
-                pts,
-                None,
-                winSize=self._lk_win,
-                maxLevel=self._lk_levels,
-                criteria=self._lk_term,
-            )
-        except Exception:
-            return None, None, None
-
-    def _evaluate_model(
-        self,
-        model_type: str,
-        matrix: np.ndarray,
-        inliers: Optional[np.ndarray],
-        p0: np.ndarray,
-        curr_surv: np.ndarray,
-    ) -> Optional[Dict[str, Any]]:
-        try:
-            if model_type == "homography":
-                H_prev_curr = matrix.astype(np.float64)
-            else:
-                H_prev_curr = np.eye(3, dtype=np.float64)
-                H_prev_curr[:2, :] = matrix
-        except Exception:
-            return None
-
-        mask = inliers.reshape(-1).astype(bool) if inliers is not None else np.ones(len(p0), dtype=bool)
-        inlier_count = int(mask.sum())
-        inlier_ratio = float(inlier_count / max(1, len(p0)))
-
-        try:
-            cond_val = float(np.linalg.cond(H_prev_curr))
-        except Exception:
-            cond_val = None
-
-        if inlier_count > 0:
-            prev_in = p0[mask]
-            curr_in = curr_surv[mask]
-            proj = np.array(
-                apply_homography_points([(float(x), float(y)) for x, y in prev_in], H_prev_curr),
-                dtype=np.float32,
-            )
-            errs = np.linalg.norm(curr_in - proj, axis=1)
-            med_err = float(np.median(errs)) if errs.size > 0 else 1e9
-        else:
-            med_err = 1e9
-
-        scale_x = None
-        scale_y = None
-        scale_ok = True
-        try:
-            basis0 = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-            basis1 = cv2.perspectiveTransform(basis0.reshape(-1, 1, 2), H_prev_curr).reshape(-1, 2)
-            scale_x = float(np.linalg.norm(basis1[1] - basis1[0]))
-            scale_y = float(np.linalg.norm(basis1[2] - basis1[0]))
-            lo = 1.0 - float(self.cfg.gates.max_scale_change_per_frame)
-            hi = 1.0 + float(self.cfg.gates.max_scale_change_per_frame)
-            scale_ok = (lo <= scale_x <= hi) and (lo <= scale_y <= hi)
-        except Exception:
-            pass
-
-        cond_cap = 120.0 if model_type == "homography" else 400.0
-        ratio_floor = max(self.cfg.core.min_inlier_ratio, 0.5 if model_type == "homography" else 0.4)
-        err_cap = self.cfg.core.ransac_reproj_thresh * (1.5 if model_type == "affine" else 1.2)
-
-        passes_primary = (
-            inlier_ratio >= ratio_floor
-            and inlier_count >= self.cfg.core.min_inliers
-            and med_err <= err_cap
-            and (cond_val is None or cond_val <= cond_cap)
-            and scale_ok
-        )
-
-        return {
-            "type": model_type,
-            "H": H_prev_curr,
-            "inliers": inlier_count,
-            "inlier_ratio": inlier_ratio,
-            "median_error": med_err,
-            "cond": cond_val,
-            "scale_x": scale_x,
-            "scale_y": scale_y,
-            "scale_ok": scale_ok,
-            "passes_primary": passes_primary,
-        }
-
-    def _estimate_models(
-        self,
-        p0: np.ndarray,
-        curr_surv: np.ndarray,
-    ) -> List[Dict[str, Any]]:
-        models: List[Dict[str, Any]] = []
-
-        try:
-            H, inliers = cv2.findHomography(
-                p0,
-                curr_surv,
-                cv2.RANSAC,
-                ransacReprojThreshold=self.cfg.core.ransac_reproj_thresh,
-            )
-            if H is not None:
-                evaluated = self._evaluate_model("homography", H, inliers, p0, curr_surv)
-                if evaluated:
-                    models.append(evaluated)
-        except Exception:
-            pass
-
-        try:
-            M, inliers = cv2.estimateAffinePartial2D(
-                p0,
-                curr_surv,
-                method=cv2.RANSAC,
-                ransacReprojThreshold=self.cfg.core.ransac_reproj_thresh,
-            )
-            if M is not None:
-                evaluated = self._evaluate_model("affine", M, inliers, p0, curr_surv)
-                if evaluated:
-                    models.append(evaluated)
-        except Exception:
-            pass
-
-        return models
-
     # ---------- API ----------
-    def set_keyframe(self, frame_index: int, frame_bgr: np.ndarray, key_corners: List[Point]) -> None:
+    def set_keyframe(
+        self,
+        frame_index: int,
+        frame_bgr: np.ndarray,
+        key_corners: List[Point],
+        net_measurement: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._frame_index = int(frame_index)
         gray = self._to_gray(frame_bgr)
         corners_ord = np.array(order_corners(key_corners), dtype=np.float32)
@@ -707,10 +510,18 @@ class CourtLKTracker:
         try:
             H_img2model, model_size = compute_homography(order_corners(corners_ord.tolist()))
             self.H_key_img_to_model = H_img2model
+            try:
+                H_model2img = np.linalg.inv(H_img2model)
+                if abs(H_model2img[2, 2]) > 1e-12:
+                    H_model2img = H_model2img / H_model2img[2, 2]
+                self.H_model_to_key_img = H_model2img
+            except Exception:
+                self.H_model_to_key_img = None
             self.model_size = model_size
             self.model_template = self._build_model_template(model_size, self.cfg.gates.template_line_px)
         except Exception:
             self.H_key_img_to_model = None
+            self.H_model_to_key_img = None
             self.model_size = None
             self.model_template = None
         # Compute template precision score at keyframe (H=I)
@@ -719,19 +530,31 @@ class CourtLKTracker:
             tscore = self._template_precision_score(gray, np.eye(3, dtype=np.float64))
         except Exception:
             tscore = None
-        self.last_tpl_prec = float(tscore) if tscore is not None else None
-        # Fuse keyframe detection into Kalman softly (do not reset velocity/state)
+        if tscore is not None:
+            self._last_tpl_prec = float(tscore)
+        # Initialise homography filter around keyframe
         if self.cfg.kalman.use_kalman:
-            sigma = self._adaptive_kf_sigma(tscore)
-            if self.KF is None:
-                self.KF = MultiCornerKalman(q_pos=self.cfg.kalman.kalman_q_pos, q_vel=self.cfg.kalman.kalman_q_vel, r_meas=sigma)
-                self.KF.reset(corners_ord)
-                self.ema_corners = corners_ord.astype(np.float64)
-            else:
-                # adapt R per-keyframe before update
-                self.KF.R = np.eye(8, dtype=np.float64) * (sigma ** 2)
-                smoothed = self.KF.update(corners_ord)
-                self.ema_corners = smoothed.astype(np.float64)
+            if self.H_filter is None:
+                self.H_filter = HomographyKalman(
+                    q=getattr(self.cfg.kalman, "homography_q", self.cfg.kalman.kalman_q_pos),
+                    r=getattr(self.cfg.kalman, "homography_r", self.cfg.kalman.kalman_r_meas),
+                    static_scale=getattr(self.cfg.kalman, "homography_static_scale", 0.1),
+                )
+            self.H_filter.reset(self.curr_H)
+            meas_scale = 1.0
+            if self.cfg.kalman.kf_adaptive_from_template and tscore is not None:
+                base_r = max(getattr(self.cfg.kalman, "homography_r", self.cfg.kalman.kalman_r_meas), 1e-6)
+                sigma = self._adaptive_kf_sigma(tscore)
+                meas_scale = max(sigma / base_r, 1e-3)
+            self.H_filter.update(self.curr_H, meas_scale=meas_scale)
+            filtered = self.H_filter.current_matrix()
+            if filtered is not None:
+                self.curr_H = filtered
+            curr_pts = np.array(
+                apply_homography_points(self.keyframe_corners.tolist(), self.curr_H),
+                dtype=np.float32,
+            )
+            self.ema_corners = curr_pts.astype(np.float64)
         else:
             # EMA fallback: blend toward new detection以避免大跳变
             if self.ema_corners is None:
@@ -743,13 +566,28 @@ class CourtLKTracker:
         r_new, a_new = self._shape_metrics(corners_ord)
         self.ref_ratio = r_new if self.ref_ratio is None else (0.9 * self.ref_ratio + 0.1 * r_new)
         self.ref_area = a_new if self.ref_area is None else (0.9 * self.ref_area + 0.1 * a_new)
-        if self._sentinel_enabled():
-            self._reset_sentinel_state(frame_index=frame_index)
-            if self.last_tpl_prec is not None:
-                self._sentinel_state["template_ref"] = float(self.last_tpl_prec)
+        # Reset sentinel state
+        self._sentinel.reset(frame_index=frame_index)
+        if self._last_tpl_prec is not None:
+            self._sentinel.set_template_ref(float(self._last_tpl_prec))
         # Note: Kalman state was softly fused above; no hard reset here
+        self._net_tracker._missing_frames = 0
+        self._net_tracker.update(
+            frame_index,
+            net_measurement,
+            self.H_model_to_key_img,
+            self.curr_H,
+            self.model_size,
+            court_corners=self.keyframe_corners.astype(np.float64) if self.keyframe_corners is not None else None,
+        )
 
-    def update(self, frame_bgr: np.ndarray, *, frame_index: Optional[int] = None) -> Tuple[Optional[List[Point]], Dict[str, Any]]:
+    def update(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        frame_index: Optional[int] = None,
+        net_measurement: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[List[Point]], Dict[str, Any]]:
         info: Dict[str, Any] = {
             "inliers": 0,
             "matches": 0,
@@ -766,8 +604,27 @@ class CourtLKTracker:
             self._frame_index += 1
         current_frame_idx = self._frame_index
         info["frame_idx"] = current_frame_idx
+        def _finalize(corners_out: Optional[List[Point]]) -> Tuple[Optional[List[Point]], Dict[str, Any]]:
+            if corners_out is not None:
+                corner_hint = np.array(order_corners(corners_out), dtype=np.float64)
+            elif self.ema_corners is not None:
+                corner_hint = self.ema_corners
+            elif self.keyframe_corners is not None:
+                corner_hint = self.keyframe_corners.astype(np.float64)
+            else:
+                corner_hint = None
+            info["net"] = self._net_tracker.update(
+                current_frame_idx,
+                net_measurement,
+                self.H_model_to_key_img,
+                self.curr_H,
+                self.model_size,
+                court_corners=corner_hint,
+            )
+            return corners_out, info
+
         if self.keyframe_gray is None or self.keyframe_corners is None or self.curr_H is None:
-            return None, info
+            return _finalize(None)
 
         gray = self._to_gray(frame_bgr)
         # Track features from prev to curr (prefer ROI LK with fallback to full-frame)
@@ -777,229 +634,190 @@ class CourtLKTracker:
         if self.prev_pts is None or len(self.prev_pts) < 4:
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="seed_features")
-            return None, info
+            self._sentinel.on_hold(info, frame_idx=current_frame_idx, reason="seed_features")
+            return _finalize(None)
 
         # ROI around previous smoothed corners to speed up LK and reduce drift
         base_corners = (self.ema_corners if self.ema_corners is not None else self.keyframe_corners).astype(np.float32)
         Hh, Ww = gray.shape[:2]
         eff_expand = max(self.cfg.features.roi_expand_ratio, float(self.cfg.features.lk_roi_expand_ratio) * float(self._roi_scale))
         rx1, ry1, rx2, ry2 = self._poly_roi_bounds(base_corners, eff_expand, Ww, Hh)
-        try:
-            prev_roi = self.prev_gray[ry1:ry2 + 1, rx1:rx2 + 1]
-            curr_roi = gray[ry1:ry2 + 1, rx1:rx2 + 1]
-            # Early motion gate: skip LK if ROI nearly static
-            if self.cfg.gates.early_motion_gate:
-                try:
-                    mad = float(np.mean(np.abs(curr_roi.astype(np.int16) - prev_roi.astype(np.int16))))
-                    info["roi_mad"] = mad
-                    if mad <= float(self.cfg.gates.early_motion_mad_gray_thr):
-                        # Predict only and output EMA/current projection
-                        if self.cfg.kalman.use_kalman and self.KF is not None:
-                            try:
-                                self.KF.set_static(True)
-                                self.KF.predict()
-                                pos = (self.KF.H @ self.KF.x).reshape(4, 2)
-                                self.ema_corners = pos.astype(np.float64)
-                            except Exception:
-                                pass
+        prev_roi = self.prev_gray[ry1:ry2 + 1, rx1:rx2 + 1]
+        curr_roi = gray[ry1:ry2 + 1, rx1:rx2 + 1]
+        # Early motion gate: skip LK if ROI nearly static
+        if self.cfg.gates.early_motion_gate:
+            try:
+                mad = float(np.mean(np.abs(curr_roi.astype(np.int16) - prev_roi.astype(np.int16))))
+                info["roi_mad"] = mad
+                if mad <= float(self.cfg.gates.early_motion_mad_gray_thr):
+                    # Predict only and output EMA/current projection
+                    base: np.ndarray
+                    if self.cfg.kalman.use_kalman and self.H_filter is not None:
+                        try:
+                            self.H_filter.set_static(True)
+                            self.H_filter.predict()
+                        except Exception:
+                            pass
+                        predicted = self.H_filter.current_matrix()
+                        if predicted is not None:
+                            self.curr_H = predicted
+                            base = np.array(
+                                apply_homography_points(self.keyframe_corners.tolist(), self.curr_H),
+                                dtype=np.float32,
+                            )
+                            self.ema_corners = base.astype(np.float64)
+                        else:
+                            base = (
+                                self.ema_corners.astype(np.float32)
+                                if self.ema_corners is not None
+                                else np.array(
+                                    apply_homography_points(self.keyframe_corners.tolist(), self.curr_H),
+                                    dtype=np.float32,
+                                )
+                            )
+                    else:
                         if self.ema_corners is None:
-                            base = np.array(apply_homography_points(self.keyframe_corners.tolist(), self.curr_H), dtype=np.float32)
+                            base = np.array(
+                                apply_homography_points(self.keyframe_corners.tolist(), self.curr_H),
+                                dtype=np.float32,
+                            )
                         else:
                             base = self.ema_corners.astype(np.float32)
-                        if self._corners_degenerate(base):
-                            info["degenerate"] = True
-                            info["hold"] = True
-                            self.hold_left = max(0, self.hold_left - 1)
-                            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="degenerate")
-                            self.prev_gray = gray
-                            self._early_stop_streak = 0
-                            # If we are here, it means motion was detected, so ensure KF is in dynamic mode
-                            if self.cfg.kalman.use_kalman and self.KF is not None:
-                                try:
-                                    self.KF.set_static(False)
-                                except Exception:
-                                    pass
-                            return None, info
-                        out_pts = [(float(x), float(y)) for x, y in order_corners(base.tolist())]
-                        info["early_stop"] = True
+                    if self._corners_degenerate(base):
+                        info["degenerate"] = True
+                        info["hold"] = True
+                        self.hold_left = max(0, self.hold_left - 1)
+                        self._sentinel.on_hold(info, frame_idx=current_frame_idx, reason="degenerate")
                         self.prev_gray = gray
-                        self.hold_left = self.cfg.core.hold_ttl_frames
-                        self._frame_tick = (self._frame_tick + 1) % 1000000
-                        self._early_stop_streak += 1
-                        max_stall = max(int(self.cfg.core.hold_ttl_frames), 12)
-                        if self._early_stop_streak >= max_stall:
-                            info["needs_redetect"] = True
-                            reasons = info.setdefault("sentinel_reasons", [])
-                            reasons.append("stalled")
-                        else:
-                            info.pop("needs_redetect", None)
-                        return out_pts, info
-                except Exception:
-                    pass
-            self._early_stop_streak = 0
-            pts0 = self.prev_pts.reshape(-1, 2).astype(np.float32)
-            pts0_roi = (pts0 - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-            # Optional ROI downsample for speed
-            use_ds = bool(self.cfg.performance.use_roi_downsample) and (0.0 < float(self.cfg.performance.roi_downsample_scale) < 1.0)
-            if use_ds:
-                s = float(self.cfg.performance.roi_downsample_scale)
-                new_w = max(2, int(round(prev_roi.shape[1] * s)))
-                new_h = max(2, int(round(prev_roi.shape[0] * s)))
-                prev_roi_ds = cv2.resize(prev_roi, (new_w, new_h))
-                curr_roi_ds = cv2.resize(curr_roi, (new_w, new_h))
-                pts0_roi_ds = pts0_roi * s
-                flow_future = self._executor.submit(self._lk_flow, prev_roi_ds, curr_roi_ds, pts0_roi_ds)
-                next_pts_roi_ds, st, err = flow_future.result()
-                next_pts_roi = (next_pts_roi_ds / s) if next_pts_roi_ds is not None else None
-            else:
-                flow_future = self._executor.submit(self._lk_flow, prev_roi, curr_roi, pts0_roi)
-                next_pts_roi, st, err = flow_future.result()
-            st = st.reshape(-1) if st is not None else None
-            next_pts = (next_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2) if next_pts_roi is not None else None
-            used_roi = True
-        except Exception:
-            next_pts, st, err = None, None, None
-            used_roi = False
-        # Fallback to full-frame LK if ROI fails
-        if next_pts is None or st is None:
-            flow_future = self._executor.submit(self._lk_flow, self.prev_gray, gray, self.prev_pts)
-            next_pts, st, err = flow_future.result()
-            st = st.reshape(-1) if st is not None else None
-            used_roi = False
-        if next_pts is None or st is None:
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="lk_flow")
-            return None, info
+                        self._early_stop_streak = 0
+                        # If we are here, it means motion was detected, so ensure KF is in dynamic mode
+                        if self.cfg.kalman.use_kalman and self.H_filter is not None:
+                            try:
+                                self.H_filter.set_static(False)
+                            except Exception:
+                                pass
+                        return _finalize(None)
+                    out_pts = [(float(x), float(y)) for x, y in order_corners(base.tolist())]
+                    info["early_stop"] = True
+                    self.prev_gray = gray
+                    self.hold_left = self.cfg.core.hold_ttl_frames
+                    self._frame_tick = (self._frame_tick + 1) % 1000000
+                    self._early_stop_streak += 1
+                    max_stall = max(int(self.cfg.core.hold_ttl_frames), 12)
+                    if self._early_stop_streak >= max_stall:
+                        info["needs_redetect"] = True
+                        reasons = info.setdefault("sentinel_reasons", [])
+                        reasons.append("stalled")
+                    else:
+                        info.pop("needs_redetect", None)
+                    return _finalize(out_pts)
+            except Exception:
+                pass
+        self._early_stop_streak = 0
+        used_roi = rx2 > rx1 and ry2 > ry1
+        info["roi_used"] = used_roi
 
-        # Forward-backward check to prune unstable tracks
-        try:
-            if used_roi:
-                # Backward on ROI as well
-                next_pts_roi = (next_pts.reshape(-1, 2) - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-                back_future = self._executor.submit(self._lk_flow, curr_roi, prev_roi, next_pts_roi)
-                back_pts_roi, st_back, _ = back_future.result()
-                back_pts = (back_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2) if back_pts_roi is not None else None
-            else:
-                back_future = self._executor.submit(self._lk_flow, gray, self.prev_gray, next_pts)
-                back_pts, st_back, _ = back_future.result()
-            st_back = st_back.reshape(-1) if st_back is not None else None
-        except Exception:
-            back_pts, st_back = None, None
-
-        p0_all = self.prev_pts.reshape(-1, 2)
-        p1_all = next_pts.reshape(-1, 2)
-        good = (st == 1)
-        if back_pts is not None and st_back is not None:
-            p0_back = back_pts.reshape(-1, 2)
-            good = good & (st_back == 1)
-            fb_err = np.linalg.norm(p0_all - p0_back, axis=1)
-            good = good & (fb_err <= float(self.cfg.core.fb_reproj_thresh))
-
-        p0 = p0_all[good]
-        p1 = p1_all[good]
-        info["matches"] = int(len(p0))
-        if len(p0) < 4:
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="low_matches")
-            return None, info
-        # Update ROI scale and Kalman gains based on motion statistics
-        try:
-            disp = np.linalg.norm(p1 - p0, axis=1)
-            md = float(np.median(disp)) if disp.size > 0 else 0.0
-            self._motion_history.append(md)
-
-            motion_ref = float(max(1e-6, self.cfg.kalman.motion_md_ref_px))
-            motion_norm = float(np.clip(md / motion_ref, 0.0, 1.5))
-            desired_tracks = max(1, int(self.cfg.features.reseed_min_tracks))
-            feature_frac = float(len(p1)) / float(desired_tracks)
-            feature_frac = float(np.clip(feature_frac, 0.0, 1.5))
-            feature_pressure = float(np.clip(1.0 - feature_frac, 0.0, 1.0))
-            target = 1.0 + 0.35 * motion_norm + 0.45 * feature_pressure
-            self._roi_scale = float(np.clip(0.6 * self._roi_scale + 0.4 * target, 1.0, 2.0))
-
-            if self.cfg.kalman.use_kalman and self.KF is not None and self.cfg.kalman.kalman_q_scale_from_motion:
-                hist = np.array(self._motion_history, dtype=np.float32)
-                avg_motion = float(np.mean(hist)) if hist.size else md
-                trend = 0.0
-                if hist.size >= 2:
-                    trend = float((hist[-1] - hist[0]) / max(1, hist.size - 1))
-                burst = float((float(hist.max()) - float(hist.min())) / max(1, hist.size)) if hist.size else 0.0
-                norm_avg = float(np.clip(avg_motion / motion_ref, 0.0, 2.0))
-                norm_trend = float(np.clip(abs(trend) / motion_ref, 0.0, 1.5))
-                norm_burst = float(np.clip(burst / motion_ref, 0.0, 1.5))
-                blend = min(1.25, 0.55 * norm_avg + 0.3 * norm_trend + 0.15 * norm_burst)
-                qlo = float(self.cfg.kalman.kalman_q_scale_lo)
-                qhi = float(self.cfg.kalman.kalman_q_scale_hi)
-                scale = qlo + (qhi - qlo) * min(1.0, blend)
-                self.KF.set_process_scale(scale)
-        except Exception:
-            pass
-
-        # Estimate prev->curr transform (sliding window)
-        curr_surv = p1
-        models_future = self._executor.submit(self._estimate_models, p0, curr_surv)
-        models = models_future.result()
-        if not models:
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="model_estimation")
-            return None, info
-
-        preferred = "homography" if self.cfg.core.use_homography else "affine"
-
-        def model_score(model: Dict[str, Any]) -> Tuple[int, int, float, float]:
-            return (
-                0 if model["type"] == preferred else 1,
-                0 if model["passes_primary"] else 1,
-                -model["inliers"],
-                model["median_error"],
-            )
-
-        passing = [m for m in models if m["passes_primary"]]
-        if not passing:
-            info["hold"] = True
-            self.hold_left = max(0, self.hold_left - 1)
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="model_quality")
-            return None, info
-
-        candidate_pool = passing
-        candidate_pool.sort(key=model_score)
-        selected = candidate_pool[0]
-
-        H_prev_curr = selected["H"]
-        info["method"] = f"{selected['type']}(prev->curr)"
-        info["inliers"] = int(selected["inliers"])
-        info["inlier_ratio"] = float(selected["inlier_ratio"])
-        info["condH"] = selected["cond"]
-        sx = selected.get("scale_x")
-        sy = selected.get("scale_y")
-        med_err = float(selected["median_error"])
-        s_ok = bool(selected["scale_ok"])
-        cond_cap = 120.0 if selected["type"] == "homography" else 400.0
-        err_cap_final = self.cfg.core.ransac_reproj_thresh * (1.2 if selected["type"] == "homography" else 1.5)
-
-        gating_fail = (
-            info["inlier_ratio"] < max(self.cfg.core.min_inlier_ratio, 0.5 if selected["type"] == "homography" else 0.4)
-            or info["inliers"] < self.cfg.core.min_inliers
-            or med_err > err_cap_final
-            or (info["condH"] is not None and info["condH"] > cond_cap)
-            or (not s_ok)
+        # Estimate motion using MotionEstimator
+        p0_result, curr_surv, selected_model = self._motion_estimator.estimate_motion(
+            gray=gray,
+            prev_gray=self.prev_gray,
+            prev_pts=self.prev_pts,
+            base_corners=base_corners,
+            info=info,
+            _roi_scale=self._roi_scale,
+            last_tpl_prec=self.last_tpl_prec,
+            used_roi=used_roi,
+            rx1=rx1,
+            ry1=ry1,
+            rx2=rx2,
+            ry2=ry2,
         )
+        
+        if p0_result is not None and curr_surv is not None:
+            try:
+                disp = np.linalg.norm(curr_surv - p0_result, axis=1)
+                md = float(np.median(disp)) if disp.size > 0 else 0.0
+                self._motion_history.append(md)
 
-        if gating_fail:
+                motion_ref = float(max(1e-6, self.cfg.kalman.motion_md_ref_px))
+                motion_norm = float(np.clip(md / motion_ref, 0.0, 1.5))
+                desired_tracks = max(1, int(self.cfg.features.reseed_min_tracks))
+                feature_frac = float(len(curr_surv)) / float(desired_tracks)
+                feature_frac = float(np.clip(feature_frac, 0.0, 1.5))
+                feature_pressure = float(np.clip(1.0 - feature_frac, 0.0, 1.0))
+                target = 1.0 + 0.35 * motion_norm + 0.45 * feature_pressure
+                self._roi_scale = float(np.clip(0.6 * self._roi_scale + 0.4 * target, 1.0, 2.0))
+
+                if self.cfg.kalman.use_kalman and self.H_filter is not None and self.cfg.kalman.kalman_q_scale_from_motion:
+                    hist = np.array(self._motion_history, dtype=np.float32)
+                    avg_motion = float(np.mean(hist)) if hist.size else md
+                    trend = 0.0
+                    if hist.size >= 2:
+                        trend = float((hist[-1] - hist[0]) / max(1, hist.size - 1))
+                    burst = float((float(hist.max()) - float(hist.min())) / max(1, hist.size)) if hist.size else 0.0
+                    norm_avg = float(np.clip(avg_motion / motion_ref, 0.0, 2.0))
+                    norm_trend = float(np.clip(abs(trend) / motion_ref, 0.0, 1.5))
+                    norm_burst = float(np.clip(burst / motion_ref, 0.0, 1.5))
+                    blend = min(1.25, 0.55 * norm_avg + 0.3 * norm_trend + 0.15 * norm_burst)
+                    qlo = float(self.cfg.kalman.kalman_q_scale_lo)
+                    qhi = float(self.cfg.kalman.kalman_q_scale_hi)
+                    scale = qlo + (qhi - qlo) * min(1.0, blend)
+                    self.H_filter.set_process_scale(scale)
+            except Exception:
+                pass
+        
+        if p0_result is None or curr_surv is None or selected_model is None:
             info["hold"] = True
             self.hold_left = max(0, self.hold_left - 1)
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="gating_fail")
-            return None, info
+            self._sentinel.on_hold(info, frame_idx=current_frame_idx, reason="model_estimation")
+            return _finalize(None)
+            
+        # Update info with model results
+        info.update({
+            "method": f"{selected_model['type']}(prev->curr)",
+            "inliers": int(selected_model["inliers"]),
+            "inlier_ratio": float(selected_model["inlier_ratio"]),
+            "condH": selected_model.get("cond"),
+            "med_reproj_err": float(selected_model["median_error"]),
+        })
+        
+        if selected_model.get("ecc_score") is not None:
+            info["ecc_score"] = float(selected_model["ecc_score"])
+            
+        H_prev_curr = selected_model["H"]
 
         # Accept: accumulate transform keyframe->current
         self.curr_H = H_prev_curr @ self.curr_H
         # Normalize to keep H numerically stable
         if abs(self.curr_H[2, 2]) > 1e-12:
             self.curr_H = self.curr_H / self.curr_H[2, 2]
+
+        if self.cfg.kalman.use_kalman:
+            if self.H_filter is None:
+                self.H_filter = HomographyKalman(
+                    q=getattr(self.cfg.kalman, "homography_q", self.cfg.kalman.kalman_q_pos),
+                    r=getattr(self.cfg.kalman, "homography_r", self.cfg.kalman.kalman_r_meas),
+                    static_scale=getattr(self.cfg.kalman, "homography_static_scale", 0.1),
+                )
+                self.H_filter.reset(self.curr_H)
+            else:
+                try:
+                    self.H_filter.set_static(False)
+                    self.H_filter.predict()
+                except Exception:
+                    pass
+                try:
+                    meas_scale = 1.0 + info.get("med_reproj_err", 0.0) / max(self.cfg.core.ransac_reproj_thresh, 1e-6)
+                    if self.cfg.kalman.kf_adaptive_from_template and self.last_tpl_prec is not None:
+                        base_r = max(getattr(self.cfg.kalman, "homography_r", self.cfg.kalman.kalman_r_meas), 1e-6)
+                        sigma = self._adaptive_kf_sigma(self.last_tpl_prec)
+                        meas_scale = max(meas_scale * max(sigma / base_r, 1e-3), 1e-3)
+                    self.H_filter.update(self.curr_H, meas_scale=meas_scale)
+                    filtered = self.H_filter.current_matrix()
+                    if filtered is not None:
+                        self.curr_H = filtered
+                except Exception:
+                    pass
 
         # Apply to keyframe corners
         curr_corners = np.array(apply_homography_points(self.keyframe_corners.tolist(), self.curr_H), dtype=np.float32)
@@ -1032,8 +850,8 @@ class CourtLKTracker:
             seed_future = self._executor.submit(self._seed_features, gray, curr_corners.astype(np.float32))
             self.prev_pts = seed_future.result()
             self.prev_gray = gray
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="degenerate")
-            return None, info
+            self._sentinel.on_hold(info, frame_idx=current_frame_idx, reason="degenerate")
+            return _finalize(None)
 
         # Geometric sanity checks (ratio/area and jump vs smoothed)
         ratio, area = self._shape_metrics(curr_corners)
@@ -1055,7 +873,8 @@ class CourtLKTracker:
                 try:
                     tscore = self._template_precision_score(gray, self.curr_H)
                     info["tpl_prec"] = tscore
-                    self.last_tpl_prec = float(tscore)
+                    if tscore is not None:
+                        self._last_tpl_prec = float(tscore)
                     if tscore < self.cfg.gates.template_min_precision:
                         ok_geo = False
                 except Exception:
@@ -1069,8 +888,8 @@ class CourtLKTracker:
             seed_future = self._executor.submit(self._seed_features, gray, base_corners)
             self.prev_pts = seed_future.result()
             self.prev_gray = gray
-            self._sentinel_on_hold(info, frame_idx=current_frame_idx, reason="geometry")
-            return None, info
+            self._sentinel.on_hold(info, frame_idx=current_frame_idx, reason="geometry")
+            return _finalize(None)
 
         # Re-seed features if tracks are low
         if len(curr_surv) < self.cfg.features.reseed_min_tracks:
@@ -1084,22 +903,11 @@ class CourtLKTracker:
         self.prev_gray = gray
         self.hold_left = self.cfg.core.hold_ttl_frames
 
-        if self.cfg.kalman.use_kalman and self.KF is not None:
-            try:
-                smoothed = self.KF.update(curr_corners)
-                self.ema_corners = smoothed.astype(np.float64)
-            except Exception:
-                if self.ema_corners is None:
-                    self.ema_corners = curr_corners.astype(np.float64)
-                else:
-                    a = self.cfg.core.ema_alpha
-                    self.ema_corners = self.ema_corners * a + curr_corners.astype(np.float64) * (1.0 - a)
+        if self.ema_corners is None:
+            self.ema_corners = curr_corners.astype(np.float64)
         else:
-            if self.ema_corners is None:
-                self.ema_corners = curr_corners.astype(np.float64)
-            else:
-                a = self.cfg.core.ema_alpha
-                self.ema_corners = self.ema_corners * a + curr_corners.astype(np.float64) * (1.0 - a)
+            a = self.cfg.core.ema_alpha
+            self.ema_corners = self.ema_corners * a + curr_corners.astype(np.float64) * (1.0 - a)
         if self.reference_corners is None:
             self.reference_corners = curr_corners.astype(np.float32)
         else:
@@ -1114,25 +922,28 @@ class CourtLKTracker:
         # enrich info for diagnostics
         info["roi_used"] = bool(used_roi)
         info["roi_scale"] = float(self._roi_scale)
-        info["med_reproj_err"] = float(med_err)
         try:
-            info["scale_x"] = float(sx)
-            info["scale_y"] = float(sy)
+            info["scale_x"] = float(selected_model.get("scale_x", 1.0))
+            info["scale_y"] = float(selected_model.get("scale_y", 1.0))
         except Exception:
             pass
-        self._sentinel_on_success(
+        # Prepare info for sentinel
+        info["ref_ratio"] = self.ref_ratio
+        info["ref_area"] = self.ref_area
+        
+        self._sentinel.on_success(
             info,
             frame_idx=current_frame_idx,
             ratio=float(ratio),
             area=float(area),
-            med_err=float(med_err),
+            med_err=float(info.get("med_reproj_err", 0.0)),
             matches=int(len(curr_surv)),
             inlier_ratio=float(info.get("inlier_ratio", 0.0)),
-            template_score=info.get("tpl_prec", self.last_tpl_prec),
+            template_score=info.get("tpl_prec", self._last_tpl_prec),
         )
         out_pts = [(float(x), float(y)) for x, y in order_corners(self.ema_corners.tolist())]
         self._frame_tick = (self._frame_tick + 1) % 1000000
-        return out_pts, info
+        return _finalize(out_pts)
 
 
     def __del__(self) -> None:
@@ -1145,4 +956,4 @@ class CourtLKTracker:
             pass
 
 
-__all__ = ["CourtLKTracker", "MultiCornerKalman"]
+__all__ = ["CourtLKTracker", "HomographyKalman", "ScalarKalman1D"]

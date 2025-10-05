@@ -15,6 +15,7 @@ detection:
     players: 6
     ball: 12
     actions: 2
+    net: 2
 
   # --- Model IDs (for Roboflow backend) ---
   models_roboflow:
@@ -22,6 +23,7 @@ detection:
     players: "players-dataset-fusrb/1"
     ball: "volleyball_v2/3"
     actions: "volleyball-actions/4"
+    net: null
 
   # --- Model Paths (for local-yolo backend) ---
   models_yolo:
@@ -34,3 +36,4 @@ detection:
     players: "weights/players_yolov8n.pt"
     ball: "weights/ball_yolov8n.pt"
     actions: "weights/actions_yolov8n.pt"
+    net: null

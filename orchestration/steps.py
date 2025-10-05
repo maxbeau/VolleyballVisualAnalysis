@@ -4,7 +4,7 @@ Step definitions for the main orchestration, refactored into classes.
 from __future__ import annotations
 import logging
 import math
-from typing import Set
+from typing import Optional, Set
 
 from core.cache import detection_cache_dir
 from core.context import PipelineContext
@@ -37,9 +37,21 @@ class DetectionStep(OrchestrationStep):
         detection_settings = self.settings.detection
         global_settings = self.settings.global_settings
 
-        model_id = detection_settings.models_roboflow.get(self.target)
+        if detection_settings is None:
+            self.logger.warning("Detection settings missing; skipping target '%s'.", self.target)
+            return
+
+        backend_key = detection_settings.backend.strip().lower() if detection_settings and detection_settings.backend else ""
+        model_id = None
+        if detection_settings is not None:
+            model_id = detection_settings.models_roboflow.get(self.target)
+            if backend_key == "local-yolo":
+                model_path = getattr(detection_settings.models_yolo, self.target, None)
+                model_id = str(model_path) if model_path else model_id
+
         if not model_id:
-            raise ValueError(f"Model ID for target '{self.target}' not found in config")
+            self.logger.warning("Skipping detection for target '%s' because no model is configured.", self.target)
+            return
 
         target_cache_dir = detection_cache_dir(
             global_settings.video_path, global_settings.cache_dir, self.target
@@ -87,6 +99,10 @@ class CourtProcessingStep(OrchestrationStep):
     def run(self) -> None:
         court_settings = self.settings.court
         detections_jsonl = self.context.get_artifact_path("court_detections")
+        try:
+            net_detections_path = self.context.get_artifact_path("net_detections")
+        except KeyError:
+            net_detections_path = None
 
         tracking_jsonl = self.context.output_dir / court_settings.outputs.output_tracking_jsonl
         tracking_meta_json = self.context.output_dir / court_settings.outputs.output_meta_json
@@ -99,6 +115,7 @@ class CourtProcessingStep(OrchestrationStep):
             cfg=court_settings,
             detection_cfg=self.settings.detection,
             min_confidence=float(self.settings.global_settings.min_confidence),
+            net_detections_jsonl=str(net_detections_path.resolve()) if net_detections_path else None,
         )
         
         self.context.register_artifact("court_tracking", court_settings.outputs.output_tracking_jsonl)

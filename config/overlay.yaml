@@ -52,6 +52,12 @@ overlay:
     mini_scale: 0.24
     mini_show_label: true
     mini_draw_poly: true
+    net:
+      enable: true
+      color: [255, 255, 255]
+      thickness: 2
+      fill_alpha: 0.18
+      post_radius: 4
 
   players:
     enable: false
