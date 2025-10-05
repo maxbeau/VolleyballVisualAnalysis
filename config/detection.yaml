@@ -18,7 +18,7 @@ detection:
 
   # --- Model IDs (for Roboflow backend) ---
   models_roboflow:
-    court: "qiuchangjiance-09bhk/4"
+    court: "qiuchangjiance-09bhk/6"
     players: "players-dataset-fusrb/1"
     ball: "volleyball_v2/3"
     actions: "volleyball-actions/4"

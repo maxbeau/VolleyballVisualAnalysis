@@ -134,6 +134,37 @@ class CourtKalmanConfig(BaseModel):
     kalman_q_scale_hi: float = 3.0
     motion_md_ref_px: float = 2.0
 
+class CourtBootstrapConfig(BaseModel):
+    """Settings for the high-quality bootstrap initialization phase."""
+    enable: bool = True
+    window_sec: float = 2.0
+    min_detections: int = 4
+    min_inliers: int = 3
+    ransac_threshold_px: float = 8.0
+    max_span_sec: float = 3.0
+
+
+class CourtSentinelConfig(BaseModel):
+    """Settings for the lightweight drift sentinel."""
+    enable: bool = True
+    warmup_frames: int = 10
+    min_gap_frames: int = 45
+    hold_bad_frames: int = 6
+    inlier_ratio_floor: float = 0.12
+    inlier_ratio_patience: int = 5
+    matches_floor: int = 25
+    matches_patience: int = 5
+    reproj_median_ceiling: float = 4.0
+    reproj_patience: int = 4
+    template_drop: float = 0.12
+    template_patience: int = 4
+    geo_ratio_tol: float = 0.35
+    geo_area_tol: float = 0.6
+    geo_patience: int = 4
+    drift_score_threshold: float = 3.0
+
+
+
 class CourtPerformanceConfig(BaseModel):
     """Settings for performance and robustness tuning."""
     use_roi_downsample: bool = True
@@ -160,6 +191,8 @@ class CourtConfig(BaseModel):
     features: CourtFeatureConfig
     gates: CourtGateConfig
     kalman: CourtKalmanConfig
+    bootstrap: CourtBootstrapConfig = Field(default_factory=CourtBootstrapConfig)
+    sentinel: CourtSentinelConfig = Field(default_factory=CourtSentinelConfig)
     performance: CourtPerformanceConfig
     homography: CourtHomographyConfig
     outputs: CourtOutputConfig

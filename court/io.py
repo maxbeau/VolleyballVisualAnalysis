@@ -5,6 +5,38 @@ import numpy as np
 from court.utils import order_corners, corners_from_prediction
 
 
+
+
+def _pick_best_court_pred(preds):
+    best = None
+    best_conf = -1.0
+    for pred in preds or []:
+        try:
+            label = str(pred.get("class", ""))
+        except Exception:
+            label = ""
+        label_lower = label.strip().lower()
+        if label_lower and "court" not in label_lower:
+            continue
+        conf_val = pred.get("confidence", 0.0)
+        try:
+            conf = float(conf_val)
+        except Exception:
+            conf = 0.0
+        if conf > best_conf:
+            best_conf = conf
+            best = pred
+    if best is None:
+        # fallback: accept any prediction if we never saw an explicit court label
+        for pred in preds or []:
+            try:
+                conf = float(pred.get("confidence", 0.0))
+            except Exception:
+                conf = 0.0
+            if conf > best_conf:
+                best_conf = conf
+                best = pred
+    return best
 def load_detections(detections_jsonl: str) -> List[Dict[str, Any]]:
     dets: List[Dict[str, Any]] = []
     with open(detections_jsonl, "r", encoding="utf-8") as f:
@@ -20,10 +52,7 @@ def load_detections(detections_jsonl: str) -> List[Dict[str, Any]]:
                 if not best:
                     preds = rec.get("predictions")
                     if isinstance(preds, list) and preds:
-                        try:
-                            best = max(preds, key=lambda p: float(p.get("confidence", 0.0) or 0.0))
-                        except Exception:
-                            best = preds[0]
+                        best = _pick_best_court_pred(preds)
                 if isinstance(best, dict):
                     try:
                         corners = corners_from_prediction(best)

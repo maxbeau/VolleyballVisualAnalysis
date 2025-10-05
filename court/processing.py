@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from collections import deque
 from typing import List, Tuple, Optional, Dict, Any, Deque
 
@@ -7,9 +8,11 @@ import numpy as np
 import cv2
 
 from core.utils import ensure_dir
-from court.utils import order_corners, shape_metrics, within_tol
-from orchestration.config import CourtConfig
+from court.utils import order_corners, shape_metrics, within_tol, corners_from_prediction
+from court.io import _pick_best_court_pred
+from orchestration.config import CourtConfig, DetectionConfig
 from court.tracker import CourtLKTracker  # canonical implementation
+from detection.factory import create_detection_backend
 from court.orientation import decide_orientation as decide_court_orientation
 from court.io import load_detections
 
@@ -127,6 +130,8 @@ def run_tracking(
     tracking_jsonl: str,
     tracking_meta_json: str,
     cfg: CourtConfig,
+    detection_cfg: Optional[DetectionConfig] = None,
+    min_confidence: float = 0.0,
 ) -> None:
     """Run tracking using the canonical CourtLKTracker and write JSONL results."""
     ensure_dir(os.path.dirname(tracking_jsonl) or ".")
@@ -139,132 +144,301 @@ def run_tracking(
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+
+    detection_backend = None
+    detection_model_id: Optional[str] = None
+    if detection_cfg is not None:
+        try:
+            backend_settings = detection_cfg.model_dump(exclude={"roboflow_api_key"})
+            detection_backend = create_detection_backend(backend_settings)
+            backend_key = detection_cfg.backend.strip().lower()
+            if backend_key == "roboflow":
+                detection_model_id = detection_cfg.models_roboflow.get("court")
+            elif backend_key == "local-yolo":
+                model_path = getattr(detection_cfg.models_yolo, "court", None)
+                detection_model_id = str(model_path) if model_path else "court"
+            else:
+                detection_model_id = detection_cfg.models_roboflow.get("court") or "court"
+        except Exception as exc:
+            logging.warning("Court on-demand detection disabled: %s", exc)
+            detection_backend = None
+            detection_model_id = None
+
+    bootstrap_cfg = cfg.bootstrap
+    bootstrap_window_frames = int(round(max(0.0, float(bootstrap_cfg.window_sec)) * fps))
+    max_span_frames = int(round(max(float(bootstrap_cfg.max_span_sec), float(bootstrap_cfg.window_sec)) * fps))
+    bootstrap_min_samples = max(1, int(bootstrap_cfg.min_detections))
+    bootstrap_min_inliers = max(1, int(bootstrap_cfg.min_inliers))
+
+    consensus_max_support = 5
+    buffer_max_age = max(consensus_max_support * 6, 30, max_span_frames + 5)
+    det_buffer_capacity = max(buffer_max_age + consensus_max_support, 64)
+    det_buffer: Deque[Dict[str, Any]] = deque(maxlen=det_buffer_capacity)
 
     tracker = CourtLKTracker(cfg=cfg)
 
     det_idx = 0
     total_detections = len(dets)
-    consensus_min_support = 3
-    consensus_max_support = 5
-    consensus_gate_px = max(cfg.gates.max_jump_px * 1.5, 14.0)
-    buffer_max_age = max(consensus_max_support * 6, 30)
-    det_buffer_capacity = max(buffer_max_age + consensus_max_support, 32)
-    det_buffer: Deque[Dict[str, Any]] = deque(maxlen=det_buffer_capacity)
-    consensus_time_constant = max(1.0, float(consensus_max_support) * 0.75)
-
-    # Collect a lightweight in-memory timeseries to compute orientation meta after tracking
     timeseries: Dict[int, List[Point]] = {}
+
+    def _run_on_demand_detection(frame_idx: int, frame_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+        if detection_backend is None or not detection_model_id:
+            return None
+        try:
+            result = detection_backend.infer(
+                frame_bgr,
+                frame_idx=frame_idx,
+                model_id=detection_model_id,
+                confidence=min_confidence,
+            )
+        except Exception as exc:
+            logging.warning("On-demand court detection failed at frame %d: %s", frame_idx, exc)
+            return None
+        preds = result.get("predictions", []) if isinstance(result, dict) else []
+        best_pred = _pick_best_court_pred(preds) if preds else None
+        if not isinstance(best_pred, dict):
+            return None
+        corners = corners_from_prediction(best_pred)
+        if not corners:
+            return None
+        try:
+            best_conf = float(best_pred.get("confidence", 0.0))
+        except Exception:
+            best_conf = 0.0
+        ordered = order_corners([(float(x), float(y)) for x, y in corners])
+        return {
+            "frame": frame_idx,
+            "corners": ordered,
+            "confidence": best_conf,
+        }
 
     with open(tracking_jsonl, "w", encoding="utf-8") as out_f:
         frame_i = 0
         last_corners: Optional[List[Point]] = None
+        bootstrap_done = not bool(bootstrap_cfg.enable)
+        bootstrap_samples: List[Dict[str, Any]] = []
+        awaiting_reset = False
+        reset_reasons: Optional[List[str]] = None
+        pending_frames: List[int] = []
+
         while frame_i < total_frames:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
 
+            if not bootstrap_done:
+                pending_frames.append(frame_i)
+
             new_detection_added = False
             while det_idx < total_detections and int(dets[det_idx]["frame"]) == frame_i:
                 det_entry = dets[det_idx]
                 ordered = order_corners(det_entry["corners"])
-                det_buffer.append(
-                    {
-                        "frame": frame_i,
-                        "corners": [(float(x), float(y)) for x, y in ordered],
-                    }
-                )
+                record = {
+                    "frame": frame_i,
+                    "corners": [(float(x), float(y)) for x, y in ordered],
+                }
+                det_buffer.append(record)
+                if not bootstrap_done and frame_i <= bootstrap_window_frames:
+                    bootstrap_samples.append(record)
                 det_idx += 1
                 new_detection_added = True
 
             _prune_detection_buffer(det_buffer, current_frame=frame_i, max_age=buffer_max_age)
 
-            consensus_result: Optional[List[Point]] = None
-            consensus_meta: Dict[str, Any] = {}
-            if new_detection_added:
-                consensus_eval = _consensus_from_buffer(
-                    det_buffer,
-                    min_support=consensus_min_support,
-                    max_support=consensus_max_support,
-                    gate_px=consensus_gate_px,
-                    current_frame=frame_i,
-                    time_constant=consensus_time_constant,
-                )
-                if consensus_eval is not None:
-                    consensus_result, consensus_meta = consensus_eval
+            keyframe_written = False
 
-            if consensus_result is not None and _consensus_passes_gates(
-                consensus_result,
-                tracker=tracker,
-                cfg=cfg,
-                last_corners=last_corners,
-            ):
-                tracker.set_keyframe(frame_i, frame, consensus_result)
-                if tracker.ema_corners is not None:
-                    write_corners = [
-                        (float(x), float(y)) for x, y in order_corners(tracker.ema_corners.tolist())
+            if not bootstrap_done:
+                enough_samples = len(bootstrap_samples) >= bootstrap_min_samples
+                deadline_hit = frame_i >= bootstrap_window_frames
+                attempt_samples: List[Dict[str, Any]] = []
+                if enough_samples:
+                    attempt_samples = [
+                        rec for rec in bootstrap_samples
+                        if max_span_frames <= 0 or frame_i - rec["frame"] <= max_span_frames
                     ]
-                else:
-                    write_corners = consensus_result
+                elif deadline_hit and bootstrap_samples:
+                    attempt_samples = bootstrap_samples[-bootstrap_min_samples:]
 
-                info: Dict[str, Any] = {
-                    "keyframe": True,
-                    "tpl_prec": getattr(tracker, "last_tpl_prec", None),
-                }
-                if consensus_meta:
-                    info["consensus_support"] = consensus_meta.get("support_frames")
-                    info["consensus_error"] = consensus_meta.get("support_error")
+                if attempt_samples:
+                    ref = tracker.build_bootstrap_reference(
+                        attempt_samples,
+                        threshold_px=bootstrap_cfg.ransac_threshold_px,
+                        min_inliers=min(len(attempt_samples), bootstrap_min_inliers),
+                    )
+                    if ref and _consensus_passes_gates(
+                        ref["corners"], tracker=tracker, cfg=cfg, last_corners=last_corners
+                    ):
+                        tracker.set_keyframe(frame_i, frame, ref["corners"])
+                        if tracker.ema_corners is not None:
+                            write_corners = [
+                                (float(x), float(y))
+                                for x, y in order_corners(tracker.ema_corners.tolist())
+                            ]
+                        else:
+                            write_corners = ref["corners"]
 
+                        info: Dict[str, Any] = {
+                            "keyframe": True,
+                            "bootstrap": True,
+                            "tpl_prec": getattr(tracker, "last_tpl_prec", None),
+                        }
+                        meta = ref.get("meta")
+                        if meta:
+                            info["bootstrap_meta"] = meta
+
+                        if pending_frames:
+                            for pf in pending_frames[:-1]:
+                                backfill_info = {"backfill": True, "bootstrap": True}
+                                out_f.write(
+                                    json.dumps(
+                                        {"frame": pf, "corners": write_corners, "info": backfill_info},
+                                        ensure_ascii=False,
+                                    ) + "\n"
+                                )
+                                timeseries[pf] = write_corners
+                            pending_frames = []
+                        out_f.write(
+                            json.dumps(
+                                {"frame": frame_i, "corners": write_corners, "info": info},
+                                ensure_ascii=False,
+                            ) + "\n"
+                        )
+                        last_corners = write_corners
+                        timeseries[frame_i] = write_corners
+                        bootstrap_done = True
+                        bootstrap_samples.clear()
+                        awaiting_reset = False
+                        reset_reasons = None
+                        keyframe_written = True
+
+            if not keyframe_written and awaiting_reset:
+                candidate_samples = [
+                    rec for rec in det_buffer
+                    if max_span_frames <= 0 or frame_i - rec["frame"] <= max_span_frames
+                ]
+                if candidate_samples:
+                    ref = tracker.build_bootstrap_reference(
+                        candidate_samples,
+                        threshold_px=bootstrap_cfg.ransac_threshold_px,
+                        min_inliers=min(len(candidate_samples), bootstrap_min_inliers),
+                    )
+                    if ref and _consensus_passes_gates(
+                        ref["corners"], tracker=tracker, cfg=cfg, last_corners=last_corners
+                    ):
+                        tracker.set_keyframe(frame_i, frame, ref["corners"])
+                        if tracker.ema_corners is not None:
+                            write_corners = [
+                                (float(x), float(y))
+                                for x, y in order_corners(tracker.ema_corners.tolist())
+                            ]
+                        else:
+                            write_corners = ref["corners"]
+
+                        info = {
+                            "keyframe": True,
+                            "tpl_prec": getattr(tracker, "last_tpl_prec", None),
+                            "sentinel_reset": True,
+                        }
+                        if reset_reasons:
+                            info["sentinel_reasons"] = reset_reasons
+                        meta = ref.get("meta")
+                        if meta:
+                            info["bootstrap_meta"] = meta
+
+                        out_f.write(
+                            json.dumps(
+                                {"frame": frame_i, "corners": write_corners, "info": info},
+                                ensure_ascii=False,
+                            ) + "\n")
+                        last_corners = write_corners
+                        timeseries[frame_i] = write_corners
+                        awaiting_reset = False
+                        reset_reasons = None
+                        keyframe_written = True
+
+            if keyframe_written:
+                frame_i += 1
+                continue
+
+            if tracker.keyframe_gray is None:
+                frame_i += 1
+                continue
+
+            corners, info = tracker.update(frame, frame_index=frame_i)
+            info = info or {}
+
+            if info.get("needs_redetect"):
+                reset_reasons = info.get("sentinel_reasons")
+                record = _run_on_demand_detection(frame_i, frame)
+                if record:
+                    det_buffer.append(record)
+                    if _consensus_passes_gates(
+                        record["corners"], tracker=tracker, cfg=cfg, last_corners=last_corners
+                    ):
+                        tracker.set_keyframe(frame_i, frame, record["corners"])
+                        if tracker.ema_corners is not None:
+                            write_corners = [
+                                (float(x), float(y))
+                                for x, y in order_corners(tracker.ema_corners.tolist())
+                            ]
+                        else:
+                            write_corners = record["corners"]
+                        info_reset: Dict[str, Any] = {
+                            "keyframe": True,
+                            "tpl_prec": getattr(tracker, "last_tpl_prec", None),
+                            "sentinel_reset": True,
+                            "on_demand_detection": True,
+                        }
+                        if reset_reasons:
+                            info_reset["sentinel_reasons"] = reset_reasons
+                        if "confidence" in record:
+                            info_reset["detection_confidence"] = record["confidence"]
+                        out_f.write(
+                            json.dumps(
+                                {"frame": frame_i, "corners": write_corners, "info": info_reset},
+                                ensure_ascii=False,
+                            ) + "\n")
+                        last_corners = write_corners
+                        timeseries[frame_i] = write_corners
+                        awaiting_reset = False
+                        reset_reasons = None
+                        frame_i += 1
+                        continue
+                awaiting_reset = True
+                info.setdefault("hold", True)
+                corners = None
+            else:
+                awaiting_reset = False
+
+            if corners is not None:
+                out_f.write(
+                    json.dumps(
+                        {"frame": frame_i, "corners": corners, "info": info},
+                        ensure_ascii=False,
+                    ) + "\n")
+                last_corners = corners
+                timeseries[frame_i] = corners
+            elif info.get("hold") and info.get("hold_left", 0) > 0 and last_corners is not None:
+                out_f.write(
+                    json.dumps(
+                        {"frame": frame_i, "corners": last_corners, "info": info},
+                        ensure_ascii=False,
+                    ) + "\n")
+                timeseries[frame_i] = last_corners
+            elif new_detection_added and last_corners is not None:
+                fallback_info = dict(info)
+                fallback_info.setdefault("consensus_stale", True)
                 out_f.write(
                     json.dumps(
                         {
                             "frame": frame_i,
-                            "corners": write_corners,
-                            "info": info,
+                            "corners": last_corners,
+                            "info": fallback_info,
                         },
                         ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-                last_corners = write_corners
-                timeseries[frame_i] = write_corners
-            else:
-                # Regular frame: predict via LK+RANSAC
-                corners, info = tracker.update(frame)
-                info = info or {}
-                if corners is not None:
-                    out_f.write(
-                        json.dumps(
-                            {"frame": frame_i, "corners": corners, "info": info},
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                    last_corners = corners
-                    timeseries[frame_i] = corners
-                elif info.get("hold") and info.get("hold_left", 0) > 0 and last_corners is not None:
-                    out_f.write(
-                        json.dumps(
-                            {"frame": frame_i, "corners": last_corners, "info": info},
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                    timeseries[frame_i] = last_corners
-                elif new_detection_added and last_corners is not None:
-                    fallback_info = dict(info)
-                    fallback_info.setdefault("consensus_stale", True)
-                    out_f.write(
-                        json.dumps(
-                            {
-                                "frame": frame_i,
-                                "corners": last_corners,
-                                "info": fallback_info,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                    timeseries[frame_i] = last_corners
+                    ) + "\n")
+                timeseries[frame_i] = last_corners
 
             frame_i += 1
 

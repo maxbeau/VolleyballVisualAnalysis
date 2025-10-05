@@ -3,6 +3,7 @@ Step definitions for the main orchestration, refactored into classes.
 """
 from __future__ import annotations
 import logging
+import math
 from typing import Set
 
 from core.cache import detection_cache_dir
@@ -47,6 +48,14 @@ class DetectionStep(OrchestrationStep):
         output_filename = f"{self.target}_detections.jsonl"
         combined_jsonl = self.context.output_dir / output_filename
 
+        # Limit court detection to the bootstrap window so later frames rely on sentinel-driven refreshes
+        max_samples = None
+        if self.target == "court":
+            bootstrap = self.settings.court.bootstrap
+            window_sec = max(float(bootstrap.window_sec), 0.0)
+            target_fps = float(detection_settings.infer_fps.get(self.target, 1) or 1)
+            # Round up to ensure we cover the requested window and minimum detections
+            max_samples = max(int(math.ceil(window_sec * target_fps)), int(bootstrap.min_detections)) if window_sec > 0 else int(bootstrap.min_detections)
         pipeline = DetectionPipeline(
             video_path=str(global_settings.video_path.resolve()),
             target_name=self.target,
@@ -57,6 +66,7 @@ class DetectionStep(OrchestrationStep):
             combined_jsonl=str(combined_jsonl.resolve()),
             save_frame_json=True,
             detection_settings=detection_settings.model_dump(exclude={"roboflow_api_key"}),
+            max_frames=max_samples,
         )
         pipeline.run()
         
@@ -87,6 +97,8 @@ class CourtProcessingStep(OrchestrationStep):
             tracking_jsonl=str(tracking_jsonl.resolve()),
             tracking_meta_json=str(tracking_meta_json.resolve()),
             cfg=court_settings,
+            detection_cfg=self.settings.detection,
+            min_confidence=float(self.settings.global_settings.min_confidence),
         )
         
         self.context.register_artifact("court_tracking", court_settings.outputs.output_tracking_jsonl)

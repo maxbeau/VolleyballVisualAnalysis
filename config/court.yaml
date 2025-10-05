@@ -22,10 +22,10 @@ court:
     max_scale_change_per_frame: 0.10
     use_template_score: true
     template_line_px: 8
-    template_min_precision: 0.34
+    template_min_precision: 0.28
     template_stride: 10
     early_motion_gate: true
-    early_motion_mad_gray_thr: 3.0
+    early_motion_mad_gray_thr: 5.0
   kalman:
     use_kalman: true
     kalman_q_pos: 1e-2
@@ -38,6 +38,30 @@ court:
     kalman_q_scale_lo: 0.5
     kalman_q_scale_hi: 3.0
     motion_md_ref_px: 2.0
+  bootstrap:
+    enable: true
+    window_sec: 2.0
+    min_detections: 4
+    min_inliers: 3
+    ransac_threshold_px: 8.0
+    max_span_sec: 3.0
+  sentinel:
+    enable: true
+    warmup_frames: 10
+    min_gap_frames: 45
+    hold_bad_frames: 6
+    inlier_ratio_floor: 0.12
+    inlier_ratio_patience: 5
+    matches_floor: 25
+    matches_patience: 5
+    reproj_median_ceiling: 4.0
+    reproj_patience: 4
+    template_drop: 0.12
+    template_patience: 4
+    geo_ratio_tol: 0.35
+    geo_area_tol: 0.6
+    geo_patience: 4
+    drift_score_threshold: 3.0
   performance:
     use_roi_downsample: true
     roi_downsample_scale: 0.5

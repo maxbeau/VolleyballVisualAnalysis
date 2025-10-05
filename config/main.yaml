@@ -18,10 +18,10 @@ global:
 # Master switch to enable or disable major stages of the pipeline.
 # The pipeline will run these steps in the correct dependency order.
 steps:
-  detection: false
-  court_processing: false
-  court_homography: false
-  players_tracking: false
+  detection: true
+  court_processing: true
+  court_homography: true
+  players_tracking: true
   trajectory_analysis: true
   overlay: true
 
