@@ -21,8 +21,7 @@ steps:
   detection: true
   court_processing: true
   court_homography: true
-  players_tracking: true
+  players_tracking: false
   trajectory_analysis: true
   overlay: true
-
 

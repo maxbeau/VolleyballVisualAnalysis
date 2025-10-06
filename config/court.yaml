@@ -1,108 +1,266 @@
 # --- Court Processing Settings -------------------------------------
+# This file configures the entire court and net tracking algorithm.
+# The parameters are grouped by their functional area within the tracker.
 court:
+  # --- Core Tracking Logic ---
+  # Foundational parameters for the CourtLKTracker.
   core:
+    # If true, use a full 8-DoF homography model. If false, use a 6-DoF affine model.
+    # Homography is better for handling perspective, but affine is more stable if motion is simple.
     use_homography: true
+    # RANSAC reprojection threshold for finding a consensus motion model (homography/affine).
+    # Unit: pixels. Typical: 2.0 - 5.0. Higher values tolerate more error.
     ransac_reproj_thresh: 3.0
+    # Number of frames to hold the last known position after tracking is lost.
+    # Unit: frames.
     hold_ttl_frames: 8
+    # Minimum ratio of inlier points required to accept a motion model.
+    # Unit: ratio (0.0-1.0).
     min_inlier_ratio: 0.15
+    # Minimum absolute number of inlier points required.
+    # Unit: count.
     min_inliers: 12
+    # Forward-backward optical flow consistency check threshold.
+    # Unit: pixels. Typical: 1.0 - 3.0.
     fb_reproj_thresh: 2.5
+    # Alpha for the Exponential Moving Average (EMA) smoothing of the final corner positions.
+    # Lower values mean more smoothing and more "lag".
+    # Unit: ratio (0.0-1.0).
     ema_alpha: 0.02
+
+  # --- Feature Detection & Tracking ---
+  # Parameters for seeding and managing LK optical flow feature points.
   features:
+    # Maximum number of feature points to track.
     feature_max: 220
+    # How much to expand the court's bounding box to define the Region of Interest (ROI) for seeding new features.
+    # Unit: ratio. 0.1 means expand by 10%.
     roi_expand_ratio: 0.16
+    # How much to expand the ROI for the LK optical flow calculation itself.
+    # Unit: ratio.
     lk_roi_expand_ratio: 0.12
+    # If the number of tracked points drops below this, the tracker will try to re-seed new features.
     reseed_min_tracks: 60
+    # Window size for sub-pixel corner refinement.
+    # Unit: pixels. Must be an odd number.
     subpix_win: 9
+    # Perform sub-pixel refinement every N frames. (1 = every frame).
+    # Unit: frames.
     subpix_stride: 6
+
+  # --- Gating & Validation ---
+  # Rules to validate the tracker's output at each frame and reject bad updates.
   gates:
+    # Maximum allowed median jump of corner points between frames.
+    # Unit: pixels.
     max_jump_px: 10.0
+    # Allowed relative tolerance for the court's aspect ratio compared to the reference.
+    # e.g., 0.3 means the ratio can deviate by up to 30%.
     ratio_tolerance: 0.30
+    # Allowed relative tolerance for the court's area.
     area_tolerance: 0.50
+    # Maximum allowed change in scale (from the motion model) per frame. Prevents sudden "zoom" artifacts.
     max_scale_change_per_frame: 0.10
+    # Whether to use the template precision score as a validation gate.
     use_template_score: true
+    # Thickness of the lines in the ideal court model used for template scoring.
+    # Unit: pixels (in model space).
     template_line_px: 8
+    # Minimum required template precision score to accept a tracking update.
+    # Unit: ratio (0.0-1.0).
     template_min_precision: 0.28
+    # Perform the (expensive) template scoring every N frames.
+    # Unit: frames.
     template_stride: 10
+    # If true, perform a quick check on ROI motion. If no motion, skip LK calculation.
     early_motion_gate: true
+    # Mean Absolute Difference threshold for the early motion gate.
+    # Unit: grayscale value (0-255).
     early_motion_mad_gray_thr: 5.0
+    # Experimental: Enforce rigid motion between court and net.
+    rigid_consistency_enable: true
+    # Max residual error for a point to be considered part of the rigid body.
+    # Unit: pixels.
+    rigid_max_residual_px: 4.5
+    # Max allowed motion magnitude for a point in the rigid body.
+    # Unit: pixels.
+    rigid_max_magnitude_px: 6.0
+    # Max allowed deviation from the consensus motion direction.
+    # Unit: degrees.
+    rigid_angle_thresh_deg: 32.0
+    # Motion threshold when the consensus motion is near zero.
+    # Unit: pixels.
+    rigid_zero_motion_px: 3.5
+    # Minimum number of points required to form a rigid body consensus.
+    rigid_min_support: 3
+
+  # --- Kalman Filtering ---
+  # Parameters for the Kalman filters that smooth homography and other states.
   kalman:
+    # Master switch to enable/disable Kalman filtering on the homography.
     use_kalman: true
+    # DEPRECATED. Use homography_q instead.
     kalman_q_pos: 1e-2
+    # DEPRECATED.
     kalman_q_vel: 5e-2
+    # DEPRECATED. Use homography_r instead.
     kalman_r_meas: 2.0
+    # Process noise for the homography Kalman filter. Higher values trust the model less and adapt faster.
     homography_q: 5.0e-4
+    # Measurement noise for the homography Kalman filter. Higher values trust the LK-derived measurement less.
     homography_r: 2.0
+    # When motion is detected as static, scale down the process noise by this factor to increase stability.
     homography_static_scale: 0.1
+    # If true, adapt measurement noise 'R' based on the template score. Higher score = lower noise.
     kf_adaptive_from_template: true
+    # Min/max range for the adaptive measurement noise 'R'.
     kf_r_api_min: 0.8
     kf_r_api_max: 2.5
+    # If true, adapt process noise 'Q' based on the magnitude of detected motion.
     kalman_q_scale_from_motion: true
+    # Min/max range for the motion-based process noise 'Q' scaling factor.
     kalman_q_scale_lo: 0.5
     kalman_q_scale_hi: 3.0
+    # The reference motion magnitude for scaling 'Q'.
+    # Unit: pixels.
     motion_md_ref_px: 2.0
+
+  # --- Bootstrap Phase ---
+  # Settings for initializing the tracker from the first few detections.
   bootstrap:
     enable: true
+    # Time window to look for initial detections.
+    # Unit: seconds.
     window_sec: 2.0
+    # Minimum number of detections required within the window to attempt bootstrap.
     min_detections: 4
+    # Minimum number of consensus inliers to accept a bootstrap reference.
     min_inliers: 3
+    # RANSAC threshold for finding the initial consensus corners.
+    # Unit: pixels.
     ransac_threshold_px: 8.0
+    # When bootstrapping, only consider detections within this time span from the current frame.
+    # Unit: seconds.
     max_span_sec: 3.0
+
+  # --- Sentinel (Drift Detection) ---
+  # Settings for the module that watches for tracking drift and triggers re-detection.
   sentinel:
     enable: true
+    # Number of frames to wait after a reset before the sentinel becomes active.
+    # Unit: frames.
     warmup_frames: 10
+    # Minimum gap between two consecutive re-detection requests.
+    # Unit: frames.
     min_gap_frames: 45
+    # Number of consecutive "bad" frames (e.g., failed geometry checks) to tolerate before triggering a reset.
     hold_bad_frames: 6
+    # Floor for the inlier ratio. If it drops below this, it's a bad sign.
     inlier_ratio_floor: 0.12
+    # Number of consecutive frames the inlier ratio can be bad before triggering.
     inlier_ratio_patience: 5
+    # Floor for the number of tracked features.
     matches_floor: 25
     matches_patience: 5
+    # Ceiling for the median reprojection error.
     reproj_median_ceiling: 4.0
     reproj_patience: 4
+    # How much the template score can drop from its reference before it's considered a bad sign.
     template_drop: 0.12
     template_patience: 4
+    # Tolerances for geometry checks (ratio and area) within the sentinel.
     geo_ratio_tol: 0.35
     geo_area_tol: 0.6
     geo_patience: 4
+    # A combined score threshold. If the sum of normalized "badness" scores exceeds this, trigger a reset.
     drift_score_threshold: 3.0
+
+  # --- Net Tracking ---
+  # Settings for the independent net tracker.
   net:
     enable: true
+    # Minimum confidence for a raw net detection to be considered as a measurement.
     measurement_min_confidence: 0.25
+    # Process noise for the net height Kalman filter.
     kalman_q: 18.0
+    # Measurement noise for the net height Kalman filter.
     kalman_r: 100.0
+    # Maximum allowed jump in net height between frames.
+    # Unit: pixels.
     max_height_jump_px: 90.0
+    # Plausible range for the net height.
+    # Unit: pixels.
     height_bounds_px: [40.0, 420.0]
+    # A fallback height to use if no estimate is available.
+    # Unit: pixels.
     fallback_height_px: 90.0
+    # Number of frames to hold the net position without a new measurement.
     hold_frames_without_measure: 20
+    # EMA alpha for smoothing the net's vertical direction vector.
     direction_ema_alpha: 0.1
+    # Class labels that identify a net detection.
     label_aliases:
       - "net"
       - "volleyball net"
+    # Physical dimensions used by the model-space tracker.
+    # Unit: meters.
     court_length_m: 18.0
     court_width_m: 9.0
     physical_height_m: 2.43
+    # Process noise for the model-space baseline Kalman filter.
+    # Unit: meters^2.
     model_process_q_m: 0.001
+    # Measurement noise for the model-space baseline Kalman filter.
+    # Unit: meters^2.
     model_measure_r_m: 0.02
+    # Kalman filter Q for the pixels-per-meter estimation.
     px_per_meter_kalman_q: 0.8
+    # Kalman filter R for the pixels-per-meter estimation.
     px_per_meter_kalman_r: 25.0
+    # Blending factor when fusing a new measurement into the model-space state.
     model_measure_blend: 0.4
+    # Gating threshold for accepting a new net measurement based on distance to prediction.
+    # Unit: pixels.
     model_measure_gate_px: 64.0
+
+  # --- Performance Tweaks ---
   performance:
+    # If true, downsample the ROI before running LK flow to improve speed.
     use_roi_downsample: true
     roi_downsample_scale: 0.5
+    # If homography estimation fails, should we try to fit a simpler affine model?
     model_fallback_affine_on_fail: true
+
+  # --- Fallback Motion Estimation (ECC) ---
+  # Settings for the template-based ECC motion estimation, used when LK fails.
   fallback:
     ecc_enable: true
+    # Only attempt ECC if the template score is above this threshold.
     ecc_min_tpl_precision: 0.24
+    # Downscale the template for faster ECC calculation.
     ecc_downscale: 0.6
+    # Gaussian blur kernel size for the ECC template.
     ecc_gauss_kernel: 5
+    # Max iterations for the ECC algorithm.
     ecc_max_iterations: 40
+    # Termination epsilon for the ECC algorithm.
     ecc_epsilon: 1.0e-4
+
+  # --- Homography & Bird's-Eye View ---
+  # Settings for the final homography output and bird's-eye view generation.
   homography:
+    # The desired scale for the bird's-eye view image.
+    # Unit: pixels per meter.
     scale_px_per_meter: 20.0
+    # The video frame to use for texturing the bird's-eye view.
+    # Unit: frame index.
     birdseye_frame_index: 100
+    # Optional: force a specific width/height for the bird's-eye model. If null, it's calculated from scale.
     model_width: null
     model_height: null
+
+  # --- Output Files ---
+  # Defines the filenames for the outputs of the court processing step.
   outputs:
     output_tracking_jsonl: "court_tracking.jsonl"
     output_meta_json: "court_meta.json"

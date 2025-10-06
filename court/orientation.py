@@ -86,7 +86,12 @@ def decide_orientation(
         if cnt == 0:
             return "horizontal"
         margin = 0.02
-        return "vertical" if (sum_v / cnt) > (sum_h / cnt + margin) else "horizontal"
+        # The template score logic is counter-intuitive:
+        # - A "vertical" template has vertical lines (net, attack lines), which matches a HORIZONTAL court (side view).
+        # - A "horizontal" template has horizontal lines, which matches a VERTICAL court (back view).
+        # We swap the return values to reflect the actual court orientation.
+        # The margin adds robustness against ambiguous cases where scores are very close.
+        return "horizontal" if (sum_v / cnt) > (sum_h / cnt) + margin else "vertical"
     except Exception:
         return "horizontal"
 

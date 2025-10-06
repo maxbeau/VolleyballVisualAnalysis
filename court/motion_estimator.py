@@ -1,43 +1,16 @@
 from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 import cv2
-from concurrent.futures import ThreadPoolExecutor
 
 
 class MotionEstimator:
     """
-    Estimates motion between frames using LK optical flow and robust model fitting.
+    Estimates motion between frames by fitting a robust model to feature point matches.
     """
 
-    def __init__(self, cfg: Any, executor: ThreadPoolExecutor) -> None:
+    def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
         self.fallback_cfg = getattr(cfg, "fallback", None)
-        self._executor = executor
-        
-        # Cached OpenCV params to avoid recreating tuples every frame
-        self._lk_win = (21, 21)
-        self._lk_levels = 3
-        self._lk_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        self._subpix_term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.01)
-
-    def _lk_flow(
-        self,
-        prev_img: np.ndarray,
-        curr_img: np.ndarray,
-        pts: np.ndarray,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        try:
-            return cv2.calcOpticalFlowPyrLK(
-                prev_img,
-                curr_img,
-                pts,
-                None,
-                winSize=self._lk_win,
-                maxLevel=self._lk_levels,
-                criteria=self._lk_term,
-            )
-        except Exception:
-            return None, None, None
 
     def _evaluate_model(
         self,
@@ -45,7 +18,7 @@ class MotionEstimator:
         matrix: np.ndarray,
         inliers: Optional[np.ndarray],
         p0: np.ndarray,
-        curr_surv: np.ndarray,
+        p1: np.ndarray,
     ) -> Optional[Dict[str, Any]]:
         try:
             if model_type == "homography":
@@ -67,7 +40,7 @@ class MotionEstimator:
 
         if inlier_count > 0:
             prev_in = p0[mask]
-            curr_in = curr_surv[mask]
+            curr_in = p1[mask]
             proj = np.array(
                 apply_homography_points([(float(x), float(y)) for x, y in prev_in], H_prev_curr),
                 dtype=np.float32,
@@ -120,19 +93,19 @@ class MotionEstimator:
     def _estimate_models(
         self,
         p0: np.ndarray,
-        curr_surv: np.ndarray,
+        p1: np.ndarray,
     ) -> List[Dict[str, Any]]:
         models: List[Dict[str, Any]] = []
 
         try:
             H, inliers = cv2.findHomography(
                 p0,
-                curr_surv,
+                p1,
                 cv2.RANSAC,
                 ransacReprojThreshold=self.cfg.core.ransac_reproj_thresh,
             )
             if H is not None:
-                evaluated = self._evaluate_model("homography", H, inliers, p0, curr_surv)
+                evaluated = self._evaluate_model("homography", H, inliers, p0, p1)
                 if evaluated:
                     models.append(evaluated)
         except Exception:
@@ -141,12 +114,12 @@ class MotionEstimator:
         try:
             M, inliers = cv2.estimateAffinePartial2D(
                 p0,
-                curr_surv,
+                p1,
                 method=cv2.RANSAC,
                 ransacReprojThreshold=self.cfg.core.ransac_reproj_thresh,
             )
             if M is not None:
-                evaluated = self._evaluate_model("affine", M, inliers, p0, curr_surv)
+                evaluated = self._evaluate_model("affine", M, inliers, p0, p1)
                 if evaluated:
                     models.append(evaluated)
         except Exception:
@@ -177,7 +150,6 @@ class MotionEstimator:
             float(self.cfg.features.lk_roi_expand_ratio) * float(_roi_scale),
         )
         
-        # Use a simplified poly_roi_bounds for this context
         xs = corners[:, 0]
         ys = corners[:, 1]
         x1, x2 = float(xs.min()), float(xs.max())
@@ -205,7 +177,7 @@ class MotionEstimator:
         prev_gray: np.ndarray,
         base_corners: np.ndarray,
         p0: np.ndarray,
-        curr_surv: np.ndarray,
+        p1: np.ndarray,
         info: Dict[str, Any],
         _roi_scale: float,
         last_tpl_prec: Optional[float],
@@ -215,7 +187,7 @@ class MotionEstimator:
         cfg = getattr(self, "fallback_cfg", None)
         if cfg is None or prev_gray is None:
             return None
-        if p0 is None or curr_surv is None or len(p0) < max(self.cfg.core.min_inliers, 4):
+        if p0 is None or p1 is None or len(p0) < max(self.cfg.core.min_inliers, 4):
             return None
         min_tpl = float(getattr(cfg, "ecc_min_tpl_precision", 0.0) or 0.0)
         if min_tpl > 0.0 and last_tpl_prec is not None and last_tpl_prec < min_tpl:
@@ -279,7 +251,7 @@ class MotionEstimator:
         if abs(H_prev_curr[2, 2]) > 1e-12:
             H_prev_curr = H_prev_curr / H_prev_curr[2, 2]
         ones = np.ones((len(p0), 1), dtype=np.uint8)
-        evaluated = self._evaluate_model("homography", H_prev_curr, ones, p0, curr_surv)
+        evaluated = self._evaluate_model("homography", H_prev_curr, ones, p0, p1)
         if evaluated is None:
             return None
         evaluated["type"] = "ecc"
@@ -289,90 +261,27 @@ class MotionEstimator:
 
     def estimate_motion(
         self,
+        p0: np.ndarray,
+        p1: np.ndarray,
         gray: np.ndarray,
         prev_gray: np.ndarray,
-        prev_pts: np.ndarray,
         base_corners: np.ndarray,
         info: Dict[str, Any],
         _roi_scale: float,
         last_tpl_prec: Optional[float],
-        used_roi: bool = False,
-        rx1: int = 0,
-        ry1: int = 0,
-        rx2: int = 0,
-        ry2: int = 0,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Dict[str, Any]]]:
-        if prev_pts is None or len(prev_pts) < 4:
-            return None, None, None
-
-        next_pts, st, err = None, None, None
         
-        # --- ROI-based LK flow ---
-        if used_roi:
-            try:
-                prev_roi = prev_gray[ry1:ry2 + 1, rx1:rx2 + 1]
-                curr_roi = gray[ry1:ry2 + 1, rx1:rx2 + 1]
-                pts0_roi = (prev_pts.reshape(-1, 2) - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-                
-                next_pts_roi, st, err = self._lk_flow(prev_roi, curr_roi, pts0_roi)
-                
-                if next_pts_roi is not None:
-                    next_pts = (next_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-            except Exception:
-                next_pts, st, err = None, None, None
-        
-        # --- Fallback to full-frame LK ---
-        if next_pts is None or st is None:
-            next_pts, st, err = self._lk_flow(prev_gray, gray, prev_pts)
-            used_roi = False
-        
-        if next_pts is None or st is None:
-            return None, None, None
-
-        # --- Backward flow for validation ---
-        back_pts, st_back = None, None
-        if used_roi:
-            try:
-                prev_roi = prev_gray[ry1:ry2 + 1, rx1:rx2 + 1]
-                curr_roi = gray[ry1:ry2 + 1, rx1:rx2 + 1]
-                next_pts_roi = (next_pts.reshape(-1, 2) - np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-                back_pts_roi, st_back, _ = self._lk_flow(curr_roi, prev_roi, next_pts_roi)
-                if back_pts_roi is not None:
-                    back_pts = (back_pts_roi.reshape(-1, 2) + np.array([rx1, ry1], dtype=np.float32)).reshape(-1, 1, 2)
-            except Exception:
-                back_pts, st_back = None, None
-        
-        if back_pts is None or st_back is None:
-            back_pts, st_back, _ = self._lk_flow(gray, prev_gray, next_pts)
-
-        if back_pts is None or st_back is None:
-             return None, None, None
-
-        # --- Filter good tracks ---
-        p0_all = prev_pts.reshape(-1, 2)
-        p1_all = next_pts.reshape(-1, 2)
-        st = st.reshape(-1)
-        st_back = st_back.reshape(-1)
-        good = (st == 1) & (st_back == 1)
-        
-        p0_back = back_pts.reshape(-1, 2)
-        fb_err = np.linalg.norm(p0_all - p0_back, axis=1)
-        good = good & (fb_err <= float(self.cfg.core.fb_reproj_thresh))
-        
-        p0 = p0_all[good]
-        p1 = p1_all[good]
         info["matches"] = int(len(p0))
         
         if len(p0) < 4:
             return None, None, None
 
         # --- Estimate motion model ---
-        curr_surv = p1
-        models = self._estimate_models(p0, curr_surv)
+        models = self._estimate_models(p0, p1)
         
         if not models:
             ecc_model = self._try_ecc_motion(
-                gray, prev_gray, base_corners, p0, curr_surv, info, _roi_scale, last_tpl_prec
+                gray, prev_gray, base_corners, p0, p1, info, _roi_scale, last_tpl_prec
             )
             if ecc_model is not None:
                 models = [ecc_model]
@@ -401,9 +310,9 @@ class MotionEstimator:
         # --- Finalize surviving points based on model inliers ---
         mask = selected["mask"]
         p0_final = p0[mask]
-        curr_surv_final = curr_surv[mask]
+        p1_final = p1[mask]
 
-        return p0_final, curr_surv_final, selected
+        return p0_final, p1_final, selected
 
 
 # Helper function to avoid circular imports

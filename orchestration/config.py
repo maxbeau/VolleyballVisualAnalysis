@@ -120,6 +120,12 @@ class CourtGateConfig(BaseModel):
     template_stride: int = 10
     early_motion_gate: bool = True
     early_motion_mad_gray_thr: float = 3.0
+    rigid_consistency_enable: bool = True
+    rigid_max_residual_px: float = 4.5
+    rigid_max_magnitude_px: float = 6.0
+    rigid_angle_thresh_deg: float = 32.0
+    rigid_zero_motion_px: float = 3.0
+    rigid_min_support: int = 3
 
 class CourtKalmanConfig(BaseModel):
     """Settings for the Kalman filter."""
