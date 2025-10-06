@@ -14,43 +14,22 @@ def decide_orientation(
     cap: Any,
     ts: Dict[int, Dict],
     model_size: Tuple[int, int],
-    mode: str = "template",
     max_samples: int = 6,
     search_window: int = 300,
 ) -> str:
     """
-    Decide court orientation: "horizontal" or "vertical".
-    modes:
-      - template: vote by template precision over a few early samples
-      - geometry: compare estimated width vs height from the first frame
-      - force_horizontal / force_vertical: override
+    Decide court orientation ("horizontal" or "vertical") by voting
+    over template precision on a few early samples.
     Args:
       cap: an opened cv2.VideoCapture (position will be restored)
       ts: dict mapping frame index -> {"corners": [(x,y)*4], ...}
       model_size: (W,H) of the standard court canvas
     """
-    mode = str(mode or "template").lower()
-    if mode == "force_horizontal":
-        return "horizontal"
-    if mode == "force_vertical":
-        return "vertical"
     keys = sorted(ts.keys())
     if not keys:
         return "horizontal"
 
-    if mode == "geometry":
-        rec = ts.get(keys[0])
-        if not rec or not rec.get("corners"):
-            return "horizontal"
-        c = rec["corners"]
-        tl, tr, br, bl = c[0], c[1], c[2], c[3]
-        def L(p, q):
-            return float(np.hypot(p[0]-q[0], p[1]-q[1]))
-        w_est = 0.5 * (L(tl, tr) + L(bl, br))
-        h_est = 0.5 * (L(tl, bl) + L(tr, br))
-        return "horizontal" if w_est >= h_est else "vertical"
-
-    # Template voting (default)
+    # Template voting
     try:
         Wm, Hm = model_size
         tpl_h = build_court_model_template(Wm, Hm, line_px=6, orientation="horizontal")
