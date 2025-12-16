@@ -242,6 +242,15 @@ def _format_and_export_results(
             "speed_mps": speed_val, "distance_m_cum": dist_cum, "height_est_m": float(wz_m),
             "flags": {"interp": bool(img_p.get("_interp", False)), "hold": bool(img_p.get("_hold", False)), "source": source},
         }
+        height_meta = trajectory_result.height_components.get(frame)
+        if height_meta:
+            debug_payload: Dict[str, Any] = {}
+            for key, value in height_meta.items():
+                if isinstance(value, (int, float)):
+                    debug_payload[key] = float(value)
+                else:
+                    debug_payload[key] = value
+            export_rows[frame]["height_debug"] = debug_payload
         csv_rows[frame] = {
             "frame": int(frame), "time_sec": (frame / fps) if fps > 0 else "",
             "world_x_px": float(wx_px), "world_y_px": float(wy_px), "world_z_px": float(wz_px),
