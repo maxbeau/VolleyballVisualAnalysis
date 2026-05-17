@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict
 
-from orchestration.config import PipelineConfig, settings
+from orchestration.config import PipelineConfig, get_settings
 
 
 def _safe_segment(value: str, fallback: str) -> str:
@@ -19,9 +19,10 @@ class PipelineContext:
     paths, and shared state between steps.
     """
 
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config: PipelineConfig, create_output_dir: bool = True):
         self.config = config
         self.video_path = self.config.global_settings.video_path
+        self.create_output_dir = create_output_dir
         self.output_dir = self._get_video_output_dir()
         self.artifacts: Dict[str, Any] = {}
 
@@ -39,7 +40,8 @@ class PipelineContext:
         digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:8]
         stem = _safe_segment(resolved.stem or "video", "video")
         video_output_dir = output_dir / f"{stem}_{digest}"
-        video_output_dir.mkdir(parents=True, exist_ok=True)
+        if self.create_output_dir:
+            video_output_dir.mkdir(parents=True, exist_ok=True)
         return video_output_dir
 
     def get_artifact_path(self, name: str) -> Path:
@@ -57,4 +59,4 @@ class PipelineContext:
     @classmethod
     def from_settings(cls) -> "PipelineContext":
         """Create a context instance from the global settings."""
-        return cls(config=settings)
+        return cls(config=get_settings())

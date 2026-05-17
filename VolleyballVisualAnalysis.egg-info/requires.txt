@@ -1,6 +1,10 @@
 inference-sdk
 opencv-python
 numpy
+PyYAML
 python-dotenv
-pydantic
+pydantic>=2
 pydantic-settings
+
+[local-yolo]
+ultralytics>=8.1

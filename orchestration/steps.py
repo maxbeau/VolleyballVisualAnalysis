@@ -6,7 +6,7 @@ import logging
 import math
 from typing import Optional, Set
 
-from core.cache import detection_cache_dir
+from core.cache import detection_cache_dir, detection_cache_signature
 from core.context import PipelineContext
 from core.steps import OrchestrationStep
 from court.homography import compute_and_save_homography, generate_birdseye_image
@@ -33,6 +33,10 @@ class DetectionStep(OrchestrationStep):
     def name(self) -> str:
         return f"detection_{self.target}"
 
+    @property
+    def output_artifacts(self) -> dict[str, str]:
+        return {f"{self.target}_detections": f"{self.target}_detections.jsonl"}
+
     def run(self) -> None:
         detection_settings = self.settings.detection
         global_settings = self.settings.global_settings
@@ -41,22 +45,15 @@ class DetectionStep(OrchestrationStep):
             self.logger.warning("Detection settings missing; skipping target '%s'.", self.target)
             return
 
-        backend_key = detection_settings.backend.strip().lower() if detection_settings and detection_settings.backend else ""
+        backend_key = detection_settings.backend_for(self.target) if detection_settings else ""
         model_id = None
         if detection_settings is not None:
-            model_id = detection_settings.models_roboflow.get(self.target)
-            if backend_key == "local-yolo":
-                model_path = getattr(detection_settings.models_yolo, self.target, None)
-                model_id = str(model_path) if model_path else model_id
+            model_id = detection_settings.model_for(self.target)
 
         if not model_id:
             self.logger.warning("Skipping detection for target '%s' because no model is configured.", self.target)
             return
 
-        target_cache_dir = detection_cache_dir(
-            global_settings.video_path, global_settings.cache_dir, self.target
-        )
-        
         output_filename = f"{self.target}_detections.jsonl"
         combined_jsonl = self.context.output_dir / output_filename
 
@@ -68,16 +65,35 @@ class DetectionStep(OrchestrationStep):
             target_fps = float(detection_settings.infer_fps.get(self.target, 1) or 1)
             # Round up to ensure we cover the requested window and minimum detections
             max_samples = max(int(math.ceil(window_sec * target_fps)), int(bootstrap.min_detections)) if window_sec > 0 else int(bootstrap.min_detections)
+        fps_sample = detection_settings.infer_fps.get(self.target, 1)
+        cache_signature = detection_cache_signature(
+            backend=backend_key,
+            model_id=str(model_id),
+            confidence=global_settings.min_confidence,
+            fps_sample=fps_sample,
+            max_frames=max_samples,
+        )
+        target_cache_dir = detection_cache_dir(
+            global_settings.video_path, global_settings.cache_dir, self.target, cache_signature
+        )
+
         pipeline = DetectionPipeline(
             video_path=str(global_settings.video_path.resolve()),
             target_name=self.target,
             model_id=model_id,
             confidence=global_settings.min_confidence,
-            fps_sample=detection_settings.infer_fps.get(self.target, 1),
+            fps_sample=fps_sample,
             cache_dir=str(target_cache_dir.resolve()),
             combined_jsonl=str(combined_jsonl.resolve()),
             save_frame_json=True,
-            detection_settings=detection_settings.model_dump(exclude={"roboflow_api_key"}),
+            detection_settings=detection_settings.model_dump(exclude={"roboflow_api_key", "ultralytics_api_key"}),
+            detection_config=detection_settings,
+            backend_settings={
+                "backend": backend_key,
+                "endpoint": detection_settings.ultralytics_endpoints.get(self.target),
+                "model": model_id,
+                "target": self.target,
+            },
             max_frames=max_samples,
         )
         pipeline.run()
@@ -95,6 +111,14 @@ class CourtProcessingStep(OrchestrationStep):
     @property
     def dependencies(self) -> Set[str]:
         return {"detection_court"}
+
+    @property
+    def output_artifacts(self) -> dict[str, str]:
+        outputs = self.settings.court.outputs
+        return {
+            "court_tracking": outputs.output_tracking_jsonl,
+            "court_meta": outputs.output_meta_json,
+        }
 
     def run(self) -> None:
         court_settings = self.settings.court
@@ -132,6 +156,14 @@ class CourtHomographyStep(OrchestrationStep):
     @property
     def dependencies(self) -> Set[str]:
         return {"court_processing"}
+
+    @property
+    def output_artifacts(self) -> dict[str, str]:
+        outputs = self.settings.court.outputs
+        return {
+            "homography_matrix": outputs.output_homography_npy,
+            "birdseye_image": outputs.output_birdseye_jpg,
+        }
 
     def run(self) -> None:
         court_settings = self.settings.court
@@ -178,6 +210,10 @@ class PlayersTrackingStep(OrchestrationStep):
     def dependencies(self) -> Set[str]:
         return {"detection_players", "court_processing"}
 
+    @property
+    def output_artifacts(self) -> dict[str, str]:
+        return {"players_tracks": self.settings.players.output_tracks_jsonl}
+
     def run(self) -> None:
         player_settings = self.settings.players
         detections_jsonl = self.context.get_artifact_path("players_detections")
@@ -208,6 +244,18 @@ class TrajectoryAnalysisStep(OrchestrationStep):
     @property
     def dependencies(self) -> Set[str]:
         return {"detection_ball", "court_homography"}
+
+    @property
+    def output_artifacts(self) -> dict[str, str]:
+        traj_settings = self.settings.trajectory_analysis
+        artifacts = {
+            "ball_trajectory_jsonl": traj_settings.output_jsonl,
+            "ball_trajectory_csv": traj_settings.output_csv,
+            "ball_path_image": traj_settings.output_path_img,
+        }
+        if getattr(traj_settings, "output_segments_img", None):
+            artifacts["ball_segments_image"] = traj_settings.output_segments_img
+        return artifacts
 
     def run(self) -> None:
         traj_settings = self.settings.trajectory_analysis
@@ -286,6 +334,10 @@ class OverlayStep(OrchestrationStep):
         if self.settings.overlay.actions.enable:
             deps.add("detection_actions")
         return deps
+
+    @property
+    def output_artifacts(self) -> dict[str, str]:
+        return {"overlay_video": self.settings.overlay.output_video_path}
 
     def run(self) -> None:
         overlay_settings = self.settings.overlay

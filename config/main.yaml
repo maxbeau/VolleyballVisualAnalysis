@@ -12,6 +12,8 @@ global:
   min_confidence: 0.2
   # Whether to show labels on bounding boxes in the final overlay video.
   show_box_labels: true
+  # Reuse existing downstream artifacts when a step is only needed as a dependency.
+  reuse_artifacts: true
 
 
 # --- Pipeline Steps ------------------------------------------------
@@ -21,7 +23,6 @@ steps:
   detection: true
   court_processing: true
   court_homography: true
-  players_tracking: false
+  players_tracking: true
   trajectory_analysis: true
   overlay: true
-

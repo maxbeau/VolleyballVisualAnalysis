@@ -5,223 +5,161 @@ Summary: A project for visual analysis of volleyball games.
 Classifier: Programming Language :: Python :: 3
 Classifier: License :: OSI Approved :: MIT License
 Classifier: Operating System :: OS Independent
-Requires-Python: >=3.8
+Requires-Python: <3.13,>=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: inference-sdk
 Requires-Dist: opencv-python
 Requires-Dist: numpy
+Requires-Dist: PyYAML
 Requires-Dist: python-dotenv
-Requires-Dist: pydantic
+Requires-Dist: pydantic>=2
 Requires-Dist: pydantic-settings
+Provides-Extra: local-yolo
+Requires-Dist: ultralytics>=8.1; extra == "local-yolo"
 
-# 🏐 Volleyball Visual Analysis
+# Volleyball Visual Analysis
 
-一个基于计算机视觉的排球视频分析工具集，能够自动完成 **目标检测**、**轨迹跟踪** 和 **战术分析**。
+This project analyzes volleyball match videos with a lightweight pipeline:
 
-本工具通过 [Roboflow](https://roboflow.com/) 的强大模型进行推理，结合卡尔曼滤波、光流法等多种技术，实现了对排球、球员和球场的高精度分析，并能将结果可视化地叠加到原视频中。
+1. run cloud or local object detection for court, players, and ball;
+2. track the court and players across frames;
+3. reconstruct and segment the ball trajectory;
+4. render an overlay video for review and downstream match analysis.
 
----
+The intended workflow is cloud inference once, then repeated local iteration on tracking, trajectory parameters, and visualization without paying for duplicate inference.
 
-## ✨ 核心功能
+## Project Layout
 
-- **多目标检测与跟踪**:
-  - **排球**: 毫秒级精准检测，并利用 Viterbi 算法和卡尔曼滤波生成平滑的运动轨迹。
-  - **球场**: 稳定识别球场边界，并通过单应性变换生成鸟瞰图。
-  - **球员**: 检测场上所有球员，并可进一步进行号码识别或动作分析。
-- **轨迹与物理分析**:
-  - 将像素坐标转换为真实的球场坐标（米）。
-  - 计算球的速度、加速度等物理量。
-- **高度可定制化**:
-  - 所有关键参数均可通过 `.env` 文件配置。
-  - 模块化设计，方便扩展或替换算法。
-- **强大的可视化**:
-  - 将检测框、轨迹线、球场边界等信息实时绘制到视频上。
-  - 支持生成迷你鸟瞰图，直观展示场上动态。
-
----
-
-## 🚀 快速上手
-
-只需三步，即可完成一次完整的视频分析。
-
-### 1. 环境准备
-
-```bash
-# 克隆项目
-git clone https://github.com/your-repo/VolleyballVisualAnalysis.git
-cd VolleyballVisualAnalysis
-
-# 创建并激活虚拟环境
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 安装依赖
-pip install -r requirements.txt
-```
-
-### 2. 配置环境
-
-在项目根目录创建一个 `.env` 文件，并填入你的 Roboflow API 密钥。
-
-```
-ROBOFLOW_API_KEY="YOUR_ROBOFLOW_API_KEY"
-```
-
-同时，将你的排球比赛视频命名为 `input.mp4` 并放置在 `data/` 目录下。
-
-### 3. 运行完整流程
-
-执行以下命令，一键完成从检测到可视化叠加的全部流程：
-
-```bash
-# 依次执行球检测、球场检测、轨迹分析和视频叠加
-python3 scripts/run_detection.py ball
-python3 scripts/run_detection.py court
-python3 scripts/run_court_processing.py
-python3 scripts/run_trajectory_analysis.py
-python3 scripts/run_overlay.py
-```
-
-分析完成后，你将在 `outputs/` 目录下找到最终的叠加视频 `ball_overlay_full.mp4` 以及其他分析数据。
-
----
-
-## 📊 工作流程
-
-本项目的数据处理流程如下图所示：
-
-```mermaid
-graph TD
-    A[输入视频] --> B{1. 目标检测};
-    B --> C[排球检测结果];
-    B --> D[球场检测结果];
-    B --> E[球员检测结果];
-
-    C --> F{2. 轨迹平滑与分析};
-    D --> G{3. 球场跟踪与单应性};
-    
-    F --> H[平滑后的球轨迹];
-    G --> I[逐帧球场角点];
-    I --> J[单应性矩阵];
-    
-    subgraph "4. 数据融合与可视化"
-        H --> K;
-        I --> K;
-        J --> K[视频叠加];
-    end
-    
-    K --> L[输出分析视频];
-    J --> M[鸟瞰图];
-    H --> N[轨迹数据 .csv];
-```
-
----
-
-## 🛠️ 详细用法
-
-### 检测模块 (`scripts/run_detection.py`)
-
-此脚本用于调用 Roboflow模型 对视频进行目标检测。
-
-- **检测排球**:
-  ```bash
-  python3 scripts/run_detection.py ball
-  ```
-- **检测球场**:
-  ```bash
-  python3 scripts/run_detection.py court
-  ```
-- **检测球员**:
-  ```bash
-  python3 scripts/run_detection.py players
-  ```
-
-#### 球员号码 OCR（可选）
-
-本项目内置了轻量的号码 OCR（基于 EasyOCR），在跟踪阶段对每个球员框的上半身区域做数字识别，并用于提高 ID 稳定性。
-
-- 开启方式：在 `.env` 中加入
-  ```
-  PLAYERS_OCR_ENABLE=true
-  # 仅识别数字，减少误报
-  PLAYERS_OCR_ALLOWLIST=0123456789
-  # 裁剪上半身区域占比（0-1），默认 0.6
-  PLAYERS_OCR_UPPER_FRAC=0.6
-  # 预处理后的目标高度（像素），默认 320
-  PLAYERS_OCR_RESIZE_H=320
-  # 若环境支持 GPU，可设置为 true
-  PLAYERS_OCR_GPU=false
-  # 最小置信度阈值
-  PLAYERS_OCR_MIN_CONF=0.5
-  ```
-
-- 运行跟踪（含 OCR）：
-  ```bash
-  python3 scripts/run_players_track.py
-  ```
-
-- 预览跟踪结果（会在标签中显示 `#号码`）：
-  ```bash
-  python3 scripts/preview_players_tracks.py
-  ```
-
-### 分析与处理模块
-
-- **处理球场数据** (平滑、插值):
-  ```bash
-  python3 scripts/run_court_processing.py
-  ```
-- **计算单应性并生成鸟瞰图**:
-  ```bash
-  python3 scripts/run_court_homography.py
-  ```
-- **分析球的轨迹** (转换为世界坐标):
-  ```bash
-  python3 scripts/run_trajectory_analysis.py
-  ```
-
-### 可视化模块
-
-- **生成最终叠加视频**:
-  ```bash
-  python3 scripts/run_overlay.py
-  ```
-- **预览球场跟踪效果**:
-  ```bash
-  python3 scripts/preview_court_tracking.py
-  ```
-
----
-
-## ⚙️ 主要配置项
-
-通过修改根目录的 `.env` 文件，你可以调整项目的各项参数。
-
-| 变量名 | 描述 | 默认值 |
-| :--- | :--- | :--- |
-| `ROBOFLOW_API_KEY` | **必需**，你的 Roboflow API 密钥 | `None` |
-| `VIDEO_PATH` | 输入视频的路径 | `data/input.mp4` |
-| `INFER_FPS` | 检测时视频的抽帧率 | `12` |
-| `OVERLAY_MIN_CONF` | 叠加时显示的最小置信度 | `0.1` |
-| `COURT_OVERLAY` | 是否在视频中叠加球场 | `True` |
-| `COURT_MINI_ENABLE`| 是否启用迷你鸟瞰图 | `True` |
-| `ACTIONS_SHOW_BOX` | 是否显示动作检测框（关闭后不显示文本） | `True` |
-| `COURT_MINI_SHOW_TEAMS` | 迷你鸟瞰图是否显示队伍名称（TeamA/TeamB） | `True` |
-
----
-
-## 📁 项目结构
-
-```
+```text
 .
-├── actions/      # 动作分析模块
-├── analysis/     # 轨迹平滑、滤波等核心分析算法
-├── ball/         # 排球检测与轨迹构建管线
-├── config/       # 项目配置文件加载
-├── core/         # 核心工具类（如 Roboflow 客户端）
-├── court/        # 球场检测、跟踪与单应性计算
-├── players/      # 球员检测与跟踪
-├── scripts/      # 可执行脚本（流程入口）
-├── visualization/ # 可视化与视频叠加
-└── outputs/      # 所有输出结果的存放目录
+├── run_pipeline.py          # CLI entrypoint
+├── config/                  # Split YAML configuration
+│   ├── main.yaml            # video path, enabled steps, artifact reuse
+│   ├── detection.yaml       # backend, model IDs, targets, sampling FPS
+│   ├── court.yaml
+│   ├── players.yaml
+│   ├── trajectory_analysis.yaml
+│   └── overlay.yaml
+├── detection/               # Roboflow and local YOLO backends
+├── court/                   # court tracking, homography, net support
+├── players/                 # player tracking
+├── ball/                    # ball selection, pseudo-3D trajectory, segmentation
+├── visualization/           # final video overlay
+└── docs/PIPELINE.md         # architecture notes
 ```
+
+## Install
+
+Use Python 3.10-3.12. The Roboflow `inference-sdk` dependency does not currently support Python 3.13+.
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+Cloud API keys are loaded from environment variables. For local development, copy
+`.env.example` to `.env` and fill in only the keys you need:
+
+```bash
+cp .env.example .env
+```
+
+The same values can also be exported directly in your shell:
+
+```bash
+export ROBOFLOW_API_KEY="..."
+export ULTRALYTICS_API_KEY="..."
+```
+
+Never commit `.env`; it is already ignored by `.gitignore`.
+
+For local YOLO inference, install the optional dependency and configure weights in `config/detection.yaml`:
+
+```bash
+pip install -e ".[local-yolo]"
+```
+
+## Quick Start
+
+Edit `config/main.yaml`:
+
+```yaml
+global:
+  video_path: "input/input.mp4"
+  output_dir: "outputs"
+  cache_dir: ".cache"
+  reuse_artifacts: true
+```
+
+Run the full player-and-ball analysis:
+
+```bash
+python3 run_pipeline.py
+```
+
+Preview the resolved workflow without running inference:
+
+```bash
+python3 run_pipeline.py --dry-run
+```
+
+Override common experiment settings from the CLI:
+
+```bash
+python3 run_pipeline.py --video input/game.mp4 --targets court,players,ball
+python3 run_pipeline.py --steps detection,trajectory_analysis,overlay
+python3 run_pipeline.py --steps overlay --cache-policy cache_only
+```
+
+## Cloud Inference Workflow
+
+The default cloud workflow is intentionally narrow:
+
+- `config/detection.yaml` defaults to `targets: ["court", "players", "ball"]`.
+- `actions` and `net` detection are not run unless explicitly enabled.
+- Detection cache directories include backend, model ID, confidence, sampling FPS, and frame cap, so changing model settings does not silently reuse stale frame caches.
+- Downstream steps can reuse existing output artifacts when they are only needed as dependencies.
+
+A practical iteration loop:
+
+```bash
+# 1. Pay for cloud detections once.
+python3 run_pipeline.py --steps detection --targets court,players,ball
+
+# 2. Iterate locally on trajectory and overlay.
+python3 run_pipeline.py --steps trajectory_analysis,overlay --cache-policy cache_only
+
+# 3. Re-render overlay only after visual changes.
+python3 run_pipeline.py --steps overlay --cache-policy cache_only
+```
+
+Outputs are stored under `outputs/<video_name>_<hash>/`. Detection frame caches are stored under `.cache/videos/<video_name>_<hash>/detection/<target>/<signature>/`.
+
+## Configuration
+
+Use `config/main.yaml` for the run-level switches:
+
+- `global.video_path`: input match video.
+- `global.output_dir`: per-video output root.
+- `global.cache_dir`: detection cache root.
+- `global.reuse_artifacts`: reuse existing dependency outputs when possible.
+- `steps.*`: enable the stages you want to run.
+
+Use `config/detection.yaml` for inference behavior:
+
+- `backend`: `roboflow` or `local-yolo`.
+- `targets`: cloud/local detection targets to run when `steps.detection` is enabled.
+- `cache_policy`: `cache_first`, `cache_only`, or `always_infer`.
+- `infer_fps`: target-specific sampling rates.
+- `models_roboflow` / `models_yolo`: model IDs or local weight paths.
+
+## Recommended Next Iteration
+
+Add a small evaluation set before heavy parameter tuning:
+
+- 3-5 short clips that represent common camera angles and rallies;
+- a lightweight annotation file for ball positions, player boxes, and touch events;
+- a script that writes `metrics.json` after each run.
+
+That closes the loop from "the overlay looks better" to measurable detection and analysis quality.

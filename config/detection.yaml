@@ -1,14 +1,22 @@
 # --- Detection Settings --------------------------------------------
 # Configures the object detection backend and target-specific models.
 detection:
-  # Backend can be 'roboflow' or 'local-yolo'.
+  # Backend can be 'roboflow', 'ultralytics', or 'local-yolo'.
   backend: "roboflow"
+  # Target-specific backend overrides. Keep players/ball on the default backend
+  # while running court detection through Ultralytics Platform.
+  target_backends:
+    court: "ultralytics"
+    players: "ultralytics"
   # --- Cache Policy ---
   # - cache_first: (Default) Use cache if available, infer missing frames, and update cache.
   # - cache_only: Only use cache. Fail if cache is missing or incomplete.
   # - always_infer: Ignore cache and always run inference, overwriting old cache.
   cache_policy: "cache_first"
-  # Roboflow API key is never stored here. Set ROBOFLOW_API_KEY in your environment or .env file.
+  # Only run the cloud/local detection targets needed for the current analysis goal.
+  targets: ["court", "players", "ball"]
+  # Cloud API keys are never stored here. Copy .env.example to .env, then set
+  # ROBOFLOW_API_KEY and/or ULTRALYTICS_API_KEY there or in your shell.
   # Inference FPS for each detection target.
   infer_fps:
     court: 3
@@ -24,6 +32,20 @@ detection:
     ball: "volleyball_v2/3"
     actions: "volleyball-actions/4"
     net: null
+
+  # --- Model IDs and endpoints (for Ultralytics Platform backend) ---
+  models_ultralytics:
+    court: "volleyball-court-1"
+    players: "volleyball-players-1"
+    ball: null
+    actions: null
+    net: null
+  ultralytics_endpoints:
+    court: "https://predict-6a05f80bf153fdc6ef77-dproatj77a-df.a.run.app/predict"
+    players: "https://predict-6a0984fd76b447dc3732-dproatj77a-df.a.run.app/predict"
+  ultralytics_iou: 0.7
+  ultralytics_imgsz: 640
+  ultralytics_timeout_sec: 60.0
 
   # --- Model Paths (for local-yolo backend) ---
   models_yolo:

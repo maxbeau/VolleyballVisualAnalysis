@@ -17,6 +17,9 @@ from orchestration.steps import (
 )
 
 
+DETECTION_TARGETS = ("court", "players", "ball", "actions", "net")
+
+
 class Orchestrator:
     """Manages the setup and execution of orchestration steps."""
 
@@ -44,9 +47,10 @@ class Orchestrator:
         """Determines which steps to run based on the configuration."""
         steps_config = self.context.config.steps
         steps_to_run = set()
+        detection_targets = self._configured_detection_targets()
 
         step_groups = {
-            "detection": ["detection_court", "detection_players", "detection_ball", "detection_actions", "detection_net"],
+            "detection": [f"detection_{target}" for target in detection_targets],
             "court_processing": [None],
             "court_homography": [None],
             "players_tracking": [None],
@@ -62,6 +66,13 @@ class Orchestrator:
                     steps_to_run.update(step_names)
                     
         return steps_to_run
+
+    def _configured_detection_targets(self) -> List[str]:
+        """Return detection targets selected for an explicit detection run."""
+        detection_config = self.context.config.detection
+        if detection_config is None:
+            return ["court", "players", "ball"]
+        return [target for target in detection_config.targets if target in DETECTION_TARGETS]
 
     def resolve_execution_order(self, steps_to_run: Set[str]) -> List[OrchestrationStep]:
         """
@@ -114,6 +125,13 @@ class Orchestrator:
 
         for step in execution_order:
             try:
+                is_explicit_step = step.name in steps_to_run_names
+                if (
+                    self.context.config.global_settings.reuse_artifacts
+                    and not is_explicit_step
+                    and step.restore_outputs()
+                ):
+                    continue
                 step()  # Step instances are callable
             except Exception as e:
                 logging.error(f"❌ Step '{step.name}' failed with an error: {e}", exc_info=True)

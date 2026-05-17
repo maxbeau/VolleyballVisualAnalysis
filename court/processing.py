@@ -284,16 +284,17 @@ def run_tracking(
     detection_model_id: Optional[str] = None
     if detection_cfg is not None:
         try:
-            backend_settings = detection_cfg.model_dump(exclude={"roboflow_api_key"})
-            detection_backend = create_detection_backend(backend_settings)
-            backend_key = detection_cfg.backend.strip().lower()
-            if backend_key == "roboflow":
-                detection_model_id = detection_cfg.models_roboflow.get("court")
-            elif backend_key == "local-yolo":
-                model_path = getattr(detection_cfg.models_yolo, "court", None)
-                detection_model_id = str(model_path) if model_path else "court"
-            else:
-                detection_model_id = detection_cfg.models_roboflow.get("court") or "court"
+            backend_key = detection_cfg.backend_for("court")
+            detection_model_id = detection_cfg.model_for("court") or "court"
+            detection_backend = create_detection_backend(
+                detection_cfg,
+                {
+                    "backend": backend_key,
+                    "endpoint": detection_cfg.ultralytics_endpoints.get("court"),
+                    "model": detection_model_id,
+                    "target": "court",
+                },
+            )
         except Exception as exc:
             logging.warning("Court on-demand detection disabled: %s", exc)
             detection_backend = None

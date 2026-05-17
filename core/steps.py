@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Set
+from pathlib import Path
+from typing import Dict, List, Set
 import logging
 
 from core.context import PipelineContext
@@ -28,6 +29,30 @@ class OrchestrationStep(ABC):
         Defaults to an empty set (no dependencies).
         """
         return set()
+
+    @property
+    def output_artifacts(self) -> Dict[str, str | Path]:
+        """Artifacts produced by this step, keyed by context artifact name."""
+        return {}
+
+    def restore_outputs(self) -> bool:
+        """Register existing output files so dependency steps can be reused."""
+        artifacts = self.output_artifacts
+        if not artifacts:
+            return False
+
+        missing = [
+            self.context.output_dir / Path(relative_path)
+            for relative_path in artifacts.values()
+            if not (self.context.output_dir / Path(relative_path)).exists()
+        ]
+        if missing:
+            return False
+
+        for artifact_name, relative_path in artifacts.items():
+            self.context.register_artifact(artifact_name, relative_path)
+        self.logger.info("Reusing existing artifacts for step '%s'.", self.name)
+        return True
 
     @abstractmethod
     def run(self) -> None:

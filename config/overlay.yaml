@@ -60,11 +60,11 @@ overlay:
       post_radius: 4
 
   players:
-    enable: false
+    enable: true
     color: [255, 0, 0]
     thickness: 2
     hold_ttl_frames: 8
-    show_box: false
+    show_box: true
 
   actions:
     enable: false

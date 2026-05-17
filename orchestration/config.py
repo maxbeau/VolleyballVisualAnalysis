@@ -20,6 +20,10 @@ load_dotenv()
 
 # --- Configuration Models ------------------------------------------
 
+DetectionTarget = Literal["court", "players", "ball", "actions", "net"]
+DetectionBackendName = Literal["roboflow", "local-yolo", "ultralytics"]
+
+
 class GlobalConfig(BaseModel):
     """Global settings for the orchestration."""
     video_path: Path
@@ -27,6 +31,7 @@ class GlobalConfig(BaseModel):
     cache_dir: Path = Path(".cache")
     min_confidence: float = Field(0.2, ge=0.0, le=1.0)
     show_box_labels: bool = True
+    reuse_artifacts: bool = True
 
 class StepsConfig(BaseModel):
     """Switches to enable or disable orchestration stages."""
@@ -49,8 +54,13 @@ class DetectionYoloConfig(BaseModel):
 
 class DetectionConfig(BaseModel):
     """Settings for the object detection stage."""
-    backend: Literal["roboflow", "local-yolo"] = "roboflow"
+    backend: DetectionBackendName = "roboflow"
+    target_backends: Dict[str, DetectionBackendName] = Field(default_factory=dict)
     cache_policy: Literal["cache_first", "cache_only", "always_infer"] = "cache_first"
+    targets: List[DetectionTarget] = Field(
+        default_factory=lambda: ["court", "players", "ball"],
+        description="Detection targets to run when the detection stage is enabled.",
+    )
     roboflow_api_key: Optional[SecretStr] = Field(
         default=None,
         env="ROBOFLOW_API_KEY",
@@ -58,16 +68,29 @@ class DetectionConfig(BaseModel):
         repr=False,
         description="Loaded exclusively from the ROBOFLOW_API_KEY environment variable",
     )
+    ultralytics_api_key: Optional[SecretStr] = Field(
+        default=None,
+        env="ULTRALYTICS_API_KEY",
+        exclude=True,
+        repr=False,
+        description="Loaded exclusively from the ULTRALYTICS_API_KEY environment variable",
+    )
     infer_fps: Dict[str, int] = {
         "court": 3, "players": 6, "ball": 12, "actions": 2, "net": 2
     }
     models_roboflow: Dict[str, Optional[str]]
+    models_ultralytics: Dict[str, Optional[str]] = Field(default_factory=dict)
+    ultralytics_endpoints: Dict[str, Optional[str]] = Field(default_factory=dict)
+    ultralytics_iou: float = Field(0.7, ge=0.0, le=0.95)
+    ultralytics_imgsz: int = Field(640, ge=32, le=1280)
+    ultralytics_timeout_sec: float = Field(60.0, gt=0.0)
     models_yolo: DetectionYoloConfig
 
     @model_validator(mode='after')
-    def check_roboflow_key(self) -> 'DetectionConfig':
-        """Ensure a valid API key is present when using the Roboflow backend."""
-        if self.backend == 'roboflow':
+    def load_cloud_keys(self) -> 'DetectionConfig':
+        """Load cloud keys when available; backend startup performs the hard check."""
+        active_backends = {self.backend, *self.target_backends.values()}
+        if 'roboflow' in active_backends:
             key_val: str | None = None
 
             if self.roboflow_api_key is not None:
@@ -80,14 +103,32 @@ class DetectionConfig(BaseModel):
                 env_key = os.getenv("ROBOFLOW_API_KEY", "").strip()
                 if env_key:
                     self.roboflow_api_key = SecretStr(env_key)
-                    key_val = env_key
+        if 'ultralytics' in active_backends:
+            key_val = None
 
-            if not key_val:
-                raise ValueError(
-                    "ROBOFLOW_API_KEY must be provided via environment when using the 'roboflow' backend. "
-                    "Add it to your .env file or export it before running the orchestration."
-                )
+            if self.ultralytics_api_key is not None:
+                try:
+                    key_val = self.ultralytics_api_key.get_secret_value()
+                except Exception:
+                    key_val = str(self.ultralytics_api_key)
+
+            if not key_val or key_val.strip() in ("", "YOUR_API_KEY_HERE"):
+                env_key = os.getenv("ULTRALYTICS_API_KEY", "").strip()
+                if env_key:
+                    self.ultralytics_api_key = SecretStr(env_key)
         return self
+
+    def backend_for(self, target: str) -> str:
+        return str(self.target_backends.get(target, self.backend)).strip().lower()
+
+    def model_for(self, target: str) -> Optional[str]:
+        backend_key = self.backend_for(target)
+        if backend_key == "local-yolo":
+            model_path = getattr(self.models_yolo, target, None)
+            return str(model_path) if model_path else None
+        if backend_key == "ultralytics":
+            return self.models_ultralytics.get(target)
+        return self.models_roboflow.get(target)
 
 class CourtCoreConfig(BaseModel):
     """Core court tracking behavior settings."""
@@ -263,6 +304,7 @@ class PlayersTrackingConfig(BaseModel):
             "association_iou": self.match_iou,
             "max_age": self.max_age,
             "min_hits": self.min_hits,
+            "output_max_age": self.hold_ttl_frames,
         }
         kwargs.update(self.tracker_overrides)
         return kwargs
@@ -524,18 +566,15 @@ def load_config(config_dir: str | Path = "config") -> PipelineConfig:
             if data:
                 merged_config.update(data)
 
-    return PipelineConfig.parse_obj(merged_config)
+    return PipelineConfig.model_validate(merged_config)
 
-# --- Singleton Instance --------------------------------------------
-
-# Load the configuration once and make it available for import across the project.
-# This avoids reloading the file and ensures a single source of truth.
-try:
-    settings = load_config()
-except FileNotFoundError:
-    logging.warning("Configuration directory 'config' not found or empty. Using default settings.")
-    settings = PipelineConfig.parse_obj({})
-except Exception as e:
-    logging.error(f"Error loading configuration from 'config' directory: {e}", exc_info=True)
-    # Fallback to default settings to allow basic imports to succeed.
-    settings = PipelineConfig.parse_obj({})
+def get_settings(config_dir: str | Path = "config") -> PipelineConfig:
+    """Compatibility helper for older callers that expect a settings object."""
+    try:
+        return load_config(config_dir)
+    except FileNotFoundError:
+        logging.exception("Configuration directory '%s' not found.", config_dir)
+        raise
+    except Exception as e:
+        logging.error("Error loading configuration from '%s': %s", config_dir, e, exc_info=True)
+        raise

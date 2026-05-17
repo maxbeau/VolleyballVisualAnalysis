@@ -150,6 +150,9 @@ class TrackerConfig:
     reid_team_side_gate: bool = True
     ocr_reject_diff_conf: float = 0.75
     ocr_match_bonus: float = 0.65
+    output_max_age: int = 8
+    output_min_visible_ratio: float = 0.35
+    output_min_box_px: float = 8.0
 
 
 @dataclass
@@ -466,6 +469,38 @@ class OCSortTrack:
                 "confidence": float(self.number_conf),
             }
         return out
+
+    def is_output_valid(self, frame_shape: Tuple[int, int]) -> bool:
+        """Return whether the current track state should be emitted downstream."""
+        if self.time_since_update > max(0, int(getattr(self.cfg, "output_max_age", self.cfg.max_age))):
+            return False
+
+        frame_h, frame_w = frame_shape[:2]
+        x1, y1, x2, y2 = self.last_tlbr
+        raw_w = max(0.0, float(x2 - x1))
+        raw_h = max(0.0, float(y2 - y1))
+        raw_area = raw_w * raw_h
+        min_px = max(1.0, float(getattr(self.cfg, "output_min_box_px", 8.0)))
+        if raw_w < min_px or raw_h < min_px or raw_area <= 0.0:
+            return False
+
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        if not (math.isfinite(cx) and math.isfinite(cy)):
+            return False
+        if cx < 0.0 or cx > float(frame_w) or cy < 0.0 or cy > float(frame_h):
+            return False
+
+        ix1 = max(0.0, min(float(frame_w), x1))
+        iy1 = max(0.0, min(float(frame_h), y1))
+        ix2 = max(0.0, min(float(frame_w), x2))
+        iy2 = max(0.0, min(float(frame_h), y2))
+        visible_w = max(0.0, ix2 - ix1)
+        visible_h = max(0.0, iy2 - iy1)
+        if visible_w < min_px or visible_h < min_px:
+            return False
+        visible_ratio = (visible_w * visible_h) / max(1e-6, raw_area)
+        return visible_ratio >= max(0.0, min(1.0, float(getattr(self.cfg, "output_min_visible_ratio", 0.35))))
 
 
 class OCSortTracker:
@@ -899,7 +934,7 @@ class OCSortTracker:
 
         outputs: List[Dict[str, Any]] = []
         for track in self.tracks:
-            if track.is_confirmed() or track.time_since_update == 0:
+            if (track.is_confirmed() or track.time_since_update == 0) and track.is_output_valid(frame_shape):
                 outputs.append(track.to_dict(frame_shape))
         return outputs
 

@@ -1,12 +1,11 @@
 actions
-analysis
 ball
 config
 core
 court
 decision
-input
-outputs
+detection
+docs
+orchestration
 players
-scripts
 visualization

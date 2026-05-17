@@ -31,7 +31,7 @@ class LocalYOLOBackend(DetectionBackend):
         if not weights_path.exists():
             raise FileNotFoundError(
                 f"Local YOLO weights not found at {weights_path}. "
-                "Configure model paths under `detection.models_yolo` in pipeline.yaml."
+                "Configure model paths under `detection.models_yolo` in config/detection.yaml."
             )
 
         self._device = common_settings.models_yolo.device

@@ -4,10 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import cv2
 
@@ -30,6 +29,8 @@ class DetectionPipeline:
         combined_jsonl: str,
         save_frame_json: bool,
         detection_settings: Dict,
+        detection_config: Any,
+        backend_settings: Optional[Dict] = None,
         max_frames: Optional[int] = None,
         pred_extractor: Optional[Callable[[Dict], List[Dict]]] = None,
     ) -> None:
@@ -43,7 +44,9 @@ class DetectionPipeline:
         self.combined_jsonl = combined_jsonl
         self.save_frame_json = save_frame_json
         self.pred_extractor = pred_extractor or self._default_pred_extractor
-        self.backend = create_detection_backend(detection_settings)
+        self.detection_config = detection_config
+        self.backend_settings = backend_settings or {}
+        self.backend = None
         self.cache_policy = detection_settings.get("cache_policy", "cache_first")
         self.detection_settings = detection_settings
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -76,7 +79,7 @@ class DetectionPipeline:
             self.logger.info(f"[{self.target_name}] All frames found in cache, skipping inference.")
 
         # 3. Rebuild the final JSONL from the complete cache
-        records = self._rebuild_from_cache(vid_fps, width, height)
+        records = self._rebuild_from_cache(frames_to_sample, vid_fps, width, height)
 
         with open(self.combined_jsonl, "w", encoding="utf-8") as out_f:
             for rec in records:
@@ -132,20 +135,16 @@ class DetectionPipeline:
                 frames_to_infer.append(frame_idx)
         return frames_to_infer
 
-    def _rebuild_from_cache(self, vid_fps: float, width: int, height: int) -> List[Dict]:
+    def _rebuild_from_cache(self, frames_to_sample: List[int], vid_fps: float, width: int, height: int) -> List[Dict]:
         """Load all results from individual cache files and compile them."""
         self.logger.info(f"[{self.target_name}] Rebuilding results from cache: {self.cache_dir}...")
-        pattern = re.compile(r"frame_(\d{6})\.json$")
-        cached_files = []
-        for name in os.listdir(self.cache_dir):
-            match = pattern.match(name)
-            if match:
-                cached_files.append((int(match.group(1)), os.path.join(self.cache_dir, name)))
-
-        cached_files.sort(key=lambda item: item[0])
-
+        missing_frames = []
         records: List[Dict] = []
-        for idx, json_path in cached_files:
+        for idx in frames_to_sample:
+            json_path = os.path.join(self.cache_dir, f"frame_{idx:06d}.json")
+            if not os.path.exists(json_path):
+                missing_frames.append(idx)
+                continue
             with open(json_path, "r", encoding="utf-8") as jf:
                 result = json.load(jf)
             preds = self.pred_extractor(result)
@@ -160,6 +159,12 @@ class DetectionPipeline:
                     "backend": self.detection_settings.get("backend", "unknown"),
                 }
             )
+        if missing_frames:
+            preview = ", ".join(str(frame) for frame in missing_frames[:10])
+            suffix = "..." if len(missing_frames) > 10 else ""
+            raise FileNotFoundError(
+                f"[{self.target_name}] Cache is incomplete after inference. Missing frames: {preview}{suffix}"
+            )
         return records
 
     def _run_inference_loop(self, cap, frames_to_infer: List[int]) -> None:
@@ -170,6 +175,7 @@ class DetectionPipeline:
         frames_set = set(frames_to_infer)
         max_frame_to_infer = max(frames_to_infer)
         current_frame_idx = 0
+        backend = self._get_backend()
         
         # Ensure we start from the beginning of the video
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -181,7 +187,7 @@ class DetectionPipeline:
 
             if current_frame_idx in frames_set:
                 json_path = os.path.join(self.cache_dir, f"frame_{current_frame_idx:06d}.json")
-                result = self.backend.infer(
+                result = backend.infer(
                     frame,
                     frame_idx=current_frame_idx,
                     model_id=self.model_id,
@@ -196,6 +202,11 @@ class DetectionPipeline:
             # Optimization: stop reading frames if we've processed all required ones
             if current_frame_idx > max_frame_to_infer:
                 break
+
+    def _get_backend(self):
+        if self.backend is None:
+            self.backend = create_detection_backend(self.detection_config, self.backend_settings)
+        return self.backend
 
     def _default_pred_extractor(self, result: Dict) -> List[Dict]:
         return result.get("predictions", []) if isinstance(result, dict) else []

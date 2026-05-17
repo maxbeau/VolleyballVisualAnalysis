@@ -242,7 +242,8 @@ def _format_and_export_results(
             "speed_mps": speed_val, "distance_m_cum": dist_cum, "height_est_m": float(wz_m),
             "flags": {"interp": bool(img_p.get("_interp", False)), "hold": bool(img_p.get("_hold", False)), "source": source},
         }
-        height_meta = trajectory_result.height_components.get(frame)
+        height_components = getattr(trajectory_result, "height_components", {})
+        height_meta = height_components.get(frame) if isinstance(height_components, dict) else None
         if height_meta:
             debug_payload: Dict[str, Any] = {}
             for key, value in height_meta.items():

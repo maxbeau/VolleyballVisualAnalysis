@@ -1,31 +1,31 @@
 """Detection backend factory helpers."""
 from __future__ import annotations
 
-from typing import Dict, Type
+from typing import Any, Dict, Type
 
 from .backends.base import DetectionBackend
 from .backends.roboflow import RoboflowBackend
+from .backends.ultralytics import UltralyticsBackend
 from .backends.yolo import LocalYOLOBackend
 
 
 _BACKENDS: Dict[str, Type[DetectionBackend]] = {
     RoboflowBackend.name: RoboflowBackend,
+    UltralyticsBackend.name: UltralyticsBackend,
     LocalYOLOBackend.name: LocalYOLOBackend,
 }
 
 
-from orchestration.config import settings
-
-def create_detection_backend(target_settings: Dict) -> DetectionBackend:
-    """Creates a detection backend based on the global pipeline settings."""
-    backend_key = settings.detection.backend.strip().lower()
+def create_detection_backend(common_settings: Any, target_settings: Dict) -> DetectionBackend:
+    """Create a detection backend from explicit settings."""
+    backend_key = str(target_settings.get("backend") or common_settings.backend).strip().lower()
     if backend_key not in _BACKENDS:
         raise ValueError(
-            f"Unsupported detection backend '{backend_key}' in pipeline.yaml. "
+            f"Unsupported detection backend '{backend_key}' in config/detection.yaml. "
             f"Available: {', '.join(sorted(_BACKENDS.keys()))}."
         )
     backend_cls = _BACKENDS[backend_key]
-    backend = backend_cls(settings.detection, target_settings)
+    backend = backend_cls(common_settings, target_settings)
     backend.ensure_ready()
     backend.warmup()
     return backend
